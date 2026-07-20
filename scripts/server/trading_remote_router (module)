@@ -1,0 +1,210 @@
+--!strict
+
+local players = game:GetService("Players")
+
+local config = require(script.Parent.Parent.shared:WaitForChild("trading_config (module)"))
+local schema = require(script.Parent.Parent.shared:WaitForChild("trading_schema (module)"))
+
+local router = {}
+router.__index = router
+
+function router.new(trading_service: any, observability: any, request_remote: RemoteEvent, push_remote: RemoteEvent)
+	local self = setmetatable({}, router)
+	self.trading_service = trading_service
+	self.observability = observability
+	self.request_remote = request_remote
+	self.push_remote = push_remote
+	self.connection = nil
+	return self
+end
+
+function router:_consume_bucket(session: any, name: string, capacity: number, refill: number): boolean
+	local now = os.clock()
+	local bucket = session.buckets[name]
+	if bucket == nil then
+		bucket = { tokens = capacity, updated_at = now }
+		session.buckets[name] = bucket
+	else
+		bucket.tokens = math.min(capacity, bucket.tokens + (now - bucket.updated_at) * refill)
+		bucket.updated_at = now
+	end
+	if bucket.tokens < 1 then
+		return false
+	end
+	bucket.tokens -= 1
+	return true
+end
+
+function router:_security_violation(session: any, reason: string, severity: number)
+	local now = os.clock()
+	local elapsed = now - session.security_updated_at
+	session.security_score = math.max(0, session.security_score - elapsed * 0.25) + severity
+	session.security_updated_at = now
+	self.observability.metrics.remote_rejections += 1
+	if severity >= 2 then
+		self.observability:emit_alert("remote_request_rejected", "warning", {
+			user_id = session.user_id,
+			reason = reason,
+			score = session.security_score,
+		}, "remote:" .. tostring(session.user_id) .. ":" .. reason)
+	end
+	if session.security_score >= config.security_kick_score and session.player.Parent == players then
+		session.player:Kick("invalid trading requests")
+	end
+end
+
+function router:_cached_result(session: any, request_id: string)
+	local cached = session.request_cache[request_id]
+	if cached == nil then
+		return nil
+	end
+	if os.clock() - cached.created_at > config.request_cache_seconds then
+		session.request_cache[request_id] = nil
+		return nil
+	end
+	return cached
+end
+
+function router:_remember(session: any, request_id: string, sequence: number, packet: any)
+	if session.request_cache[request_id] == nil then
+		table.insert(session.request_order, request_id)
+	end
+	session.request_cache[request_id] = {
+		sequence = sequence,
+		packet = packet,
+		created_at = os.clock(),
+	}
+	while #session.request_order > config.request_cache_size do
+		local oldest = table.remove(session.request_order, 1)
+		session.request_cache[oldest] = nil
+	end
+end
+
+function router:_send_result(session: any, request_id: string, sequence: number, ok: boolean, code: string, data: any)
+	local packet = {
+		version = config.protocol_version,
+		kind = "result",
+		data = {
+			request_id = request_id,
+			ok = ok,
+			code = code,
+			data = data,
+			next_sequence = session.last_sequence + 1,
+		},
+		server_time = os.time(),
+	}
+	self:_remember(session, request_id, sequence, packet)
+	if session.player.Parent == players then
+		self.push_remote:FireClient(session.player, packet)
+	end
+end
+
+function router:_on_request(player: Player, raw_request: any)
+	local session = self.trading_service:get_session(player.UserId)
+	if session == nil or not session.active then
+		return
+	end
+	if not self:_consume_bucket(session, "global", config.global_bucket_capacity, config.global_bucket_refill_per_second) then
+		self:_security_violation(session, "global_rate_limit", 1.5)
+		return
+	end
+
+	local request, validation_error = schema.validate_request(raw_request)
+	if request == nil then
+		self:_security_violation(session, validation_error, 3)
+		return
+	end
+	if request.action == "bootstrap" then
+		local limit = config.action_limits.bootstrap
+		if not self:_consume_bucket(session, "bootstrap", limit.capacity, limit.refill) then
+			self:_security_violation(session, "bootstrap_rate_limit", 0.5)
+			return
+		end
+		local _, _, data = self.trading_service:bootstrap(session)
+		self.trading_service:_send(player, "bootstrap", {
+			request_id = request.request_id,
+			ready = session.ready,
+			session = data.session,
+			next_sequence = data.next_sequence,
+			inventory = data.inventory,
+			trade = data.trade,
+		})
+		return
+	end
+	if request.session ~= session.remote_session then
+		self:_security_violation(session, "session_mismatch", 4)
+		return
+	end
+
+	local cached = self:_cached_result(session, request.request_id)
+	if cached ~= nil then
+		if cached.sequence ~= request.sequence then
+			self:_security_violation(session, "request_id_reuse", 2)
+			return
+		end
+		self.push_remote:FireClient(player, cached.packet)
+		return
+	end
+	if request.sequence ~= session.last_sequence + 1 then
+		local code = request.sequence <= session.last_sequence and "replayed_sequence" or "out_of_order_sequence"
+		self:_security_violation(session, code, request.sequence <= session.last_sequence and 2 or 0.5)
+		local packet = {
+			version = config.protocol_version,
+			kind = "result",
+			data = {
+				request_id = request.request_id,
+				ok = false,
+				code = code,
+				next_sequence = session.last_sequence + 1,
+			},
+			server_time = os.time(),
+		}
+		self.push_remote:FireClient(player, packet)
+		return
+	end
+	session.last_sequence = request.sequence
+
+	local limit = config.action_limits[request.action]
+	if not self:_consume_bucket(session, request.action, limit.capacity, limit.refill) then
+		self:_security_violation(session, request.action .. "_rate_limit", 1)
+		self:_send_result(session, request.request_id, request.sequence, false, "rate_limited", nil)
+		return
+	end
+	if not session.ready or session.record == nil then
+		self:_send_result(session, request.request_id, request.sequence, false, "not_ready", nil)
+		return
+	end
+	if session.record.pending_transaction ~= nil and request.action ~= "sync" then
+		self:_send_result(session, request.request_id, request.sequence, false, "inventory_recovering", nil)
+		self.trading_service.coordinator:start_recovery(session.record.pending_transaction)
+		return
+	end
+
+	local packed = table.pack(xpcall(function()
+		return self.trading_service:handle_action(session, request.action, request.payload)
+	end, debug.traceback))
+	if not packed[1] then
+		warn(string.format("[trading/error] action=%s user=%d error=%s", request.action, session.user_id, tostring(packed[2])))
+		self:_send_result(session, request.request_id, request.sequence, false, "internal_error", nil)
+		return
+	end
+	self:_send_result(session, request.request_id, request.sequence, packed[2], packed[3], packed[4])
+end
+
+function router:start()
+	if self.connection ~= nil then
+		return
+	end
+	self.connection = self.request_remote.OnServerEvent:Connect(function(player, request)
+		self:_on_request(player, request)
+	end)
+end
+
+function router:stop()
+	if self.connection ~= nil then
+		self.connection:Disconnect()
+		self.connection = nil
+	end
+end
+
+return router

@@ -1,0 +1,550 @@
+--!strict
+
+local http_service = game:GetService("HttpService")
+
+local config = require(script.Parent:WaitForChild("trading_config (module)"))
+local utility = require(script.Parent:WaitForChild("trading_utility (module)"))
+
+local schema = {}
+
+local item_keys = table.freeze({
+	id = true,
+	kind = true,
+	name = true,
+	tradable = true,
+	metadata = true,
+	created_at = true,
+})
+
+local envelope_keys = table.freeze({
+	version = true,
+	session = true,
+	sequence = true,
+	request_id = true,
+	action = true,
+	payload = true,
+})
+
+local payload_keys = table.freeze({
+	bootstrap = table.freeze({}),
+	invite = table.freeze({ target_user_id = true }),
+	respond = table.freeze({ trade_id = true, accept = true }),
+	set_offer = table.freeze({ trade_id = true, expected_revision = true, item_ids = true }),
+	confirm = table.freeze({ trade_id = true, expected_revision = true }),
+	cancel = table.freeze({ trade_id = true }),
+	sync = table.freeze({}),
+})
+
+local transaction_states = table.freeze({
+	prepared = true,
+	committing = true,
+	completed = true,
+	aborted = true,
+})
+
+local function normalize_json_value(value: any, depth: number, budget: { nodes: number }, seen: { [any]: boolean })
+	local value_type = type(value)
+	if value_type == "string" then
+		if not utility.is_valid_utf8(value) or #value > 512 then
+			return nil, "invalid_string"
+		end
+		budget.nodes += 1
+		return budget.nodes <= config.maximum_metadata_nodes and value or nil,
+			budget.nodes <= config.maximum_metadata_nodes and nil or "metadata_too_complex"
+	elseif value_type == "number" then
+		if not utility.is_finite_number(value) then
+			return nil, "invalid_number"
+		end
+		budget.nodes += 1
+		return budget.nodes <= config.maximum_metadata_nodes and value or nil,
+			budget.nodes <= config.maximum_metadata_nodes and nil or "metadata_too_complex"
+	elseif value_type == "boolean" then
+		budget.nodes += 1
+		return budget.nodes <= config.maximum_metadata_nodes and value or nil,
+			budget.nodes <= config.maximum_metadata_nodes and nil or "metadata_too_complex"
+	elseif value_type ~= "table" then
+		return nil, "unsupported_type"
+	end
+
+	if depth >= config.maximum_metadata_depth or seen[value] then
+		return nil, "invalid_nesting"
+	end
+	seen[value] = true
+	budget.nodes += 1
+	if budget.nodes > config.maximum_metadata_nodes then
+		seen[value] = nil
+		return nil, "metadata_too_complex"
+	end
+
+	local key_mode = ""
+	local count = 0
+	local largest_index = 0
+	for key in pairs(value) do
+		count += 1
+		if count > config.maximum_metadata_nodes then
+			seen[value] = nil
+			return nil, "metadata_too_complex"
+		end
+		if type(key) == "number" and utility.is_integer(key) and key >= 1 then
+			if key_mode == "dictionary" then
+				seen[value] = nil
+				return nil, "mixed_table"
+			end
+			key_mode = "array"
+			largest_index = math.max(largest_index, key)
+		elseif type(key) == "string" and utility.is_safe_identifier(key, 1, 64) then
+			if key_mode == "array" then
+				seen[value] = nil
+				return nil, "mixed_table"
+			end
+			key_mode = "dictionary"
+		else
+			seen[value] = nil
+			return nil, "invalid_key"
+		end
+	end
+	if key_mode == "array" and largest_index ~= count then
+		seen[value] = nil
+		return nil, "sparse_array"
+	end
+
+	local copy = {}
+	for key, child in pairs(value) do
+		local normalized, reason = normalize_json_value(child, depth + 1, budget, seen)
+		if normalized == nil then
+			seen[value] = nil
+			return nil, reason
+		end
+		copy[key] = normalized
+	end
+	seen[value] = nil
+	return copy
+end
+
+function schema.normalize_item(raw_item: any, allow_missing_id: boolean)
+	if not utility.has_only_keys(raw_item, item_keys, 6) then
+		return nil, "invalid_item_shape"
+	end
+
+	local item_id = raw_item.id
+	if item_id == nil and allow_missing_id then
+		item_id = utility.new_id("item_")
+	end
+	if not utility.is_safe_identifier(item_id, 8, config.maximum_item_id_bytes) then
+		return nil, "invalid_item_id"
+	end
+	if not utility.is_safe_identifier(raw_item.kind, 1, config.maximum_kind_bytes) then
+		return nil, "invalid_item_kind"
+	end
+	if
+		not utility.is_valid_utf8(raw_item.name)
+		or #raw_item.name < 1
+		or #raw_item.name > config.maximum_name_bytes
+		or string.find(raw_item.name, "%c") ~= nil
+	then
+		return nil, "invalid_item_name"
+	end
+	if type(raw_item.tradable) ~= "boolean" then
+		return nil, "invalid_tradable_flag"
+	end
+
+	local metadata = raw_item.metadata or {}
+	local normalized_metadata, metadata_reason = normalize_json_value(metadata, 0, { nodes = 0 }, {})
+	if normalized_metadata == nil then
+		return nil, metadata_reason
+	end
+	local encoded_ok, encoded = pcall(http_service.JSONEncode, http_service, normalized_metadata)
+	if not encoded_ok or #encoded > config.maximum_metadata_bytes then
+		return nil, "metadata_too_large"
+	end
+
+	local created_at = raw_item.created_at or os.time()
+	if not utility.is_safe_integer(created_at) or created_at < 0 then
+		return nil, "invalid_created_at"
+	end
+
+	return {
+		id = item_id,
+		kind = raw_item.kind,
+		name = raw_item.name,
+		tradable = raw_item.tradable,
+		metadata = normalized_metadata,
+		created_at = created_at,
+	}
+end
+
+function schema.new_inventory_record(user_id: number)
+	return {
+		schema_version = config.inventory_schema_version,
+		user_id = user_id,
+		revision = 0,
+		items = {},
+		settings = { trading_enabled = true },
+		pending_transaction = nil,
+		receipts = {},
+		mutation_receipts = {},
+		lease = { owner = "", token = "", expires_at = 0 },
+		updated_at = os.time(),
+	}
+end
+
+local function migrate_inventory(raw_record: any)
+	if raw_record == nil then
+		return nil
+	end
+	if type(raw_record) ~= "table" or not utility.is_integer(raw_record.schema_version) then
+		return nil, "unsupported_schema"
+	end
+	if raw_record.schema_version > config.inventory_schema_version then
+		return nil, "future_schema"
+	end
+
+	local record = utility.deep_copy(raw_record)
+	if record.schema_version == 1 then
+		record.schema_version = 2
+		record.receipts = record.receipts or {}
+		record.mutation_receipts = record.mutation_receipts or {}
+	end
+	if record.schema_version ~= config.inventory_schema_version then
+		return nil, "missing_inventory_migration"
+	end
+	return record
+end
+
+function schema.normalize_inventory(raw_record: any, user_id: number)
+	if raw_record == nil then
+		return schema.new_inventory_record(user_id)
+	end
+
+	local record, migration_error = migrate_inventory(raw_record)
+	if record == nil then
+		return nil, migration_error
+	end
+	if record.user_id ~= user_id then
+		return nil, "user_id_mismatch"
+	end
+	if not utility.is_safe_integer(record.revision) or record.revision < 0 then
+		return nil, "invalid_revision"
+	end
+	record.mutation_receipts = record.mutation_receipts or {}
+	if
+		type(record.items) ~= "table"
+		or type(record.receipts) ~= "table"
+		or type(record.mutation_receipts) ~= "table"
+	then
+		return nil, "invalid_inventory_tables"
+	end
+
+	local items = {}
+	local item_count = 0
+	for item_id, raw_item in pairs(record.items) do
+		item_count += 1
+		if item_count > config.maximum_inventory_items or type(item_id) ~= "string" then
+			return nil, "invalid_inventory_size"
+		end
+		local item, item_error = schema.normalize_item(raw_item, false)
+		if item == nil or item.id ~= item_id then
+			return nil, item_error or "item_key_mismatch"
+		end
+		items[item_id] = item
+	end
+
+	if type(record.settings) ~= "table" or type(record.settings.trading_enabled) ~= "boolean" then
+		return nil, "invalid_settings"
+	end
+	if record.pending_transaction ~= nil and not utility.is_trade_id(record.pending_transaction) then
+		return nil, "invalid_pending_transaction"
+	end
+
+	local receipts = {}
+	local receipt_count = 0
+	for transaction_id, timestamp in pairs(record.receipts) do
+		receipt_count += 1
+		if
+			receipt_count > config.maximum_receipts
+			or not utility.is_trade_id(transaction_id)
+			or not utility.is_safe_integer(timestamp)
+			or timestamp < 0
+		then
+			return nil, "invalid_receipts"
+		end
+		receipts[transaction_id] = timestamp
+	end
+
+	local mutation_receipts = {}
+	local mutation_receipt_count = 0
+	for mutation_id, timestamp in pairs(record.mutation_receipts) do
+		mutation_receipt_count += 1
+		if
+			mutation_receipt_count > config.maximum_mutation_receipts
+			or not utility.is_mutation_id(mutation_id)
+			or not utility.is_safe_integer(timestamp)
+			or timestamp < 0
+		then
+			return nil, "invalid_mutation_receipts"
+		end
+		mutation_receipts[mutation_id] = timestamp
+	end
+
+	local lease = record.lease
+	if
+		type(lease) ~= "table"
+		or type(lease.owner) ~= "string"
+		or #lease.owner > 128
+		or type(lease.token) ~= "string"
+		or #lease.token > 64
+		or not utility.is_safe_integer(lease.expires_at)
+		or lease.expires_at < 0
+	then
+		return nil, "invalid_lease"
+	end
+	if (lease.owner == "") ~= (lease.token == "") then
+		return nil, "invalid_lease"
+	end
+	if lease.owner == "" and lease.expires_at ~= 0 then
+		return nil, "invalid_lease"
+	end
+	if not utility.is_safe_integer(record.updated_at) or record.updated_at < 0 then
+		return nil, "invalid_updated_at"
+	end
+
+	return {
+		schema_version = config.inventory_schema_version,
+		user_id = user_id,
+		revision = record.revision,
+		items = items,
+		settings = { trading_enabled = record.settings.trading_enabled },
+		pending_transaction = record.pending_transaction,
+		receipts = receipts,
+		mutation_receipts = mutation_receipts,
+		lease = {
+			owner = lease.owner,
+			token = lease.token,
+			expires_at = lease.expires_at,
+		},
+		updated_at = record.updated_at,
+	}
+end
+
+function schema.public_item(item: any)
+	return {
+		id = item.id,
+		kind = item.kind,
+		name = item.name,
+		tradable = item.tradable,
+	}
+end
+
+function schema.inventory_snapshot(record: any)
+	local items = {}
+	for _, item in pairs(record.items) do
+		table.insert(items, schema.public_item(item))
+	end
+	table.sort(items, function(left, right)
+		return left.id < right.id
+	end)
+	return {
+		revision = record.revision,
+		items = items,
+		trading_enabled = record.settings.trading_enabled,
+	}
+end
+
+local function validate_item_ids(value: any)
+	if type(value) ~= "table" then
+		return nil, "invalid_item_ids"
+	end
+
+	local count = 0
+	local largest_index = 0
+	for key in pairs(value) do
+		count += 1
+		if count > config.maximum_offer_items or not utility.is_integer(key) or key < 1 then
+			return nil, "invalid_item_ids"
+		end
+		largest_index = math.max(largest_index, key)
+	end
+	if count ~= largest_index then
+		return nil, "invalid_item_ids"
+	end
+
+	local result = {}
+	local seen = {}
+	for index = 1, count do
+		local item_id = value[index]
+		if not utility.is_safe_identifier(item_id, 8, config.maximum_item_id_bytes) or seen[item_id] then
+			return nil, "invalid_item_ids"
+		end
+		seen[item_id] = true
+		result[index] = item_id
+	end
+	table.sort(result)
+	return result
+end
+
+function schema.validate_request(raw_request: any)
+	if not utility.has_only_keys(raw_request, envelope_keys, 6) then
+		return nil, "invalid_envelope"
+	end
+	if raw_request.version ~= config.protocol_version then
+		return nil, "unsupported_version"
+	end
+	if not utility.is_safe_identifier(raw_request.request_id, 16, 64) then
+		return nil, "invalid_request_id"
+	end
+	if not utility.is_safe_identifier(raw_request.session, 16, 64) then
+		return nil, "invalid_session"
+	end
+	if not utility.is_integer(raw_request.sequence) or raw_request.sequence < 0 or raw_request.sequence > 2147483647 then
+		return nil, "invalid_sequence"
+	end
+	if type(raw_request.action) ~= "string" or config.action_limits[raw_request.action] == nil then
+		return nil, "invalid_action"
+	end
+	if not utility.has_only_keys(raw_request.payload, payload_keys[raw_request.action], 3) then
+		return nil, "invalid_payload"
+	end
+
+	local payload = raw_request.payload
+	if raw_request.action == "bootstrap" then
+		if raw_request.session ~= "bootstrap_session" or raw_request.sequence ~= 0 then
+			return nil, "invalid_bootstrap"
+		end
+	elseif raw_request.sequence < 1 then
+		return nil, "invalid_sequence"
+	elseif raw_request.action == "invite" then
+		if not utility.is_safe_integer(payload.target_user_id) or payload.target_user_id <= 0 then
+			return nil, "invalid_target"
+		end
+	elseif raw_request.action == "respond" then
+		if not utility.is_trade_id(payload.trade_id) or type(payload.accept) ~= "boolean" then
+			return nil, "invalid_response"
+		end
+	elseif raw_request.action == "set_offer" then
+		if not utility.is_trade_id(payload.trade_id) or not utility.is_integer(payload.expected_revision) or payload.expected_revision < 0 then
+			return nil, "invalid_offer"
+		end
+		local item_ids, item_error = validate_item_ids(payload.item_ids)
+		if item_ids == nil then
+			return nil, item_error
+		end
+		payload = {
+			trade_id = payload.trade_id,
+			expected_revision = payload.expected_revision,
+			item_ids = item_ids,
+		}
+	elseif raw_request.action == "confirm" then
+		if not utility.is_trade_id(payload.trade_id) or not utility.is_integer(payload.expected_revision) or payload.expected_revision < 0 then
+			return nil, "invalid_confirmation"
+		end
+	elseif raw_request.action == "cancel" and not utility.is_trade_id(payload.trade_id) then
+		return nil, "invalid_trade_id"
+	end
+
+	return {
+		session = raw_request.session,
+		sequence = raw_request.sequence,
+		request_id = raw_request.request_id,
+		action = raw_request.action,
+		payload = payload,
+	}
+end
+
+function schema.normalize_transaction(raw_transaction: any, expected_id: string)
+	if type(raw_transaction) ~= "table" then
+		return nil, "invalid_transaction"
+	end
+
+	local transaction = utility.deep_copy(raw_transaction)
+	if transaction.schema_version == 1 then
+		transaction.schema_version = 2
+		transaction.protocol_revision = transaction.protocol_revision or 1
+		transaction.progress = transaction.progress or {
+			prepared = {},
+			applied = {},
+			recovery_count = 0,
+			last_error = "",
+		}
+	end
+	if
+		transaction.schema_version ~= config.transaction_schema_version
+		or transaction.protocol_revision ~= config.protocol_revision
+		or transaction.id ~= expected_id
+		or not utility.is_trade_id(expected_id)
+	then
+		return nil, "transaction_identity_mismatch"
+	end
+	if not transaction_states[transaction.state] then
+		return nil, "invalid_transaction_state"
+	end
+	if type(transaction.users) ~= "table" or #transaction.users ~= 2 then
+		return nil, "invalid_transaction_users"
+	end
+
+	local left_user_id = transaction.users[1]
+	local right_user_id = transaction.users[2]
+	if
+		not utility.is_safe_integer(left_user_id)
+		or not utility.is_safe_integer(right_user_id)
+		or left_user_id <= 0
+		or right_user_id <= 0
+		or left_user_id == right_user_id
+	then
+		return nil, "invalid_transaction_users"
+	end
+	if type(transaction.outgoing) ~= "table" then
+		return nil, "invalid_transaction_items"
+	end
+
+	local outgoing = {}
+	for _, user_id in ipairs(transaction.users) do
+		local raw_items = transaction.outgoing[tostring(user_id)]
+		if type(raw_items) ~= "table" or #raw_items > config.maximum_offer_items then
+			return nil, "invalid_transaction_items"
+		end
+		local items = {}
+		local seen = {}
+		for index, raw_item in ipairs(raw_items) do
+			local item, item_error = schema.normalize_item(raw_item, false)
+			if item == nil or seen[item.id] then
+				return nil, item_error or "duplicate_transaction_item"
+			end
+			seen[item.id] = true
+			items[index] = item
+		end
+		if #items ~= #raw_items then
+			return nil, "sparse_transaction_items"
+		end
+		outgoing[tostring(user_id)] = items
+	end
+
+	if
+		not utility.is_safe_integer(transaction.created_at)
+		or not utility.is_safe_integer(transaction.updated_at)
+		or transaction.created_at < 0
+		or transaction.updated_at < transaction.created_at
+		or type(transaction.server_id) ~= "string"
+		or #transaction.server_id > 128
+	then
+		return nil, "invalid_transaction_time"
+	end
+	if type(transaction.progress) ~= "table" then
+		return nil, "invalid_transaction_progress"
+	end
+
+	return {
+		schema_version = config.transaction_schema_version,
+		protocol_revision = config.protocol_revision,
+		id = transaction.id,
+		state = transaction.state,
+		users = { left_user_id, right_user_id },
+		outgoing = outgoing,
+		created_at = transaction.created_at,
+		updated_at = transaction.updated_at,
+		server_id = transaction.server_id,
+		progress = utility.deep_copy(transaction.progress),
+		terminal_at = transaction.terminal_at,
+	}
+end
+
+return table.freeze(schema)

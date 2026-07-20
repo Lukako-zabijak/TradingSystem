@@ -1,0 +1,116 @@
+--!strict
+
+local protocol = {}
+
+local prepared_state = table.freeze({ prepared = true })
+local committing_state = table.freeze({ prepared = true, committing = true })
+
+local function rollback_prepared(transaction: any, ops: any, prepared_users: { number })
+	local rolled_back = true
+	local rollback_error = nil
+	for _, user_id in ipairs(prepared_users) do
+		local ok, current_error = ops.rollback(user_id, transaction.id)
+		if not ok then
+			rolled_back = false
+			rollback_error = current_error
+		end
+	end
+	if not rolled_back then
+		return false, rollback_error or "rollback_incomplete"
+	end
+	local aborted, abort_error = ops.transition(transaction.id, prepared_state, "aborted")
+	return aborted ~= nil, aborted or abort_error
+end
+
+function protocol.execute(transaction: any, ops: any)
+	local created, create_result = ops.create(transaction)
+	if not created then
+		return false, create_result
+	end
+	transaction = create_result
+
+	local prepared_users = {}
+	for _, user_id in ipairs(transaction.users) do
+		local prepared, prepare_error = ops.prepare(user_id, transaction)
+		if not prepared then
+			rollback_prepared(transaction, ops, prepared_users)
+			return false, prepare_error
+		end
+		table.insert(prepared_users, user_id)
+		ops.mark_progress(transaction.id, "prepared", user_id, true)
+	end
+
+	local committing, transition_error = ops.transition(transaction.id, prepared_state, "committing")
+	if committing == nil then
+		rollback_prepared(transaction, ops, prepared_users)
+		return false, transition_error
+	end
+	transaction = committing
+
+	for _, user_id in ipairs(transaction.users) do
+		local applied, apply_error = ops.apply(user_id, transaction)
+		if not applied then
+			return false, apply_error
+		end
+		ops.mark_progress(transaction.id, "applied", user_id, true)
+	end
+
+	local completed, complete_error = ops.transition(transaction.id, committing_state, "completed")
+	if completed == nil then
+		return false, complete_error
+	end
+	return true, completed
+end
+
+function protocol.recover(transaction: any, ops: any)
+	if transaction.state == "completed" or transaction.state == "aborted" then
+		return true, transaction
+	end
+
+	if transaction.state == "prepared" then
+		local all_prepared = true
+		for _, user_id in ipairs(transaction.users) do
+			if transaction.progress.prepared[tostring(user_id)] ~= true then
+				all_prepared = false
+				break
+			end
+		end
+		if not all_prepared then
+			local rolled_back = true
+			local rollback_error = nil
+			for _, user_id in ipairs(transaction.users) do
+				local ok, current_error = ops.rollback(user_id, transaction.id)
+				if not ok then
+					rolled_back = false
+					rollback_error = current_error
+				end
+			end
+			if not rolled_back then
+				return false, rollback_error or "rollback_incomplete"
+			end
+			local aborted, abort_error = ops.transition(transaction.id, prepared_state, "aborted")
+			return aborted ~= nil, aborted or abort_error
+		end
+
+		local committing, transition_error = ops.transition(transaction.id, prepared_state, "committing")
+		if committing == nil then
+			return false, transition_error
+		end
+		transaction = committing
+	end
+
+	for _, user_id in ipairs(transaction.users) do
+		if transaction.progress.applied[tostring(user_id)] ~= true then
+			local applied, apply_error = ops.apply(user_id, transaction)
+			if not applied then
+				return false, apply_error
+			end
+			ops.mark_progress(transaction.id, "applied", user_id, true)
+		end
+	end
+
+	local completed, complete_error = ops.transition(transaction.id, committing_state, "completed")
+	return completed ~= nil, completed or complete_error
+end
+
+return table.freeze(protocol)

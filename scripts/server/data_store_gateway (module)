@@ -1,0 +1,116 @@
+--!strict
+
+local data_store_service = game:GetService("DataStoreService")
+
+local config = require(script.Parent.Parent.shared:WaitForChild("trading_config (module)"))
+
+local gateway = {}
+gateway.__index = gateway
+
+export type metrics = {
+	updates: number,
+	gets: number,
+	lists: number,
+	removes: number,
+	failures: number,
+	retries: number,
+	budget_waits: number,
+	latency_seconds: number,
+}
+
+local request_types = {
+	update = Enum.DataStoreRequestType.UpdateAsync,
+	get = Enum.DataStoreRequestType.GetAsync,
+	list = Enum.DataStoreRequestType.ListAsync,
+	remove = Enum.DataStoreRequestType.SetIncrementAsync,
+}
+
+local function retry_delay(attempt: number): number
+	return math.min(4, 0.2 * (2 ^ (attempt - 1))) + math.random() * 0.15
+end
+
+function gateway.new()
+	local self = setmetatable({}, gateway)
+	self.metrics = {
+		updates = 0,
+		gets = 0,
+		lists = 0,
+		removes = 0,
+		failures = 0,
+		retries = 0,
+		budget_waits = 0,
+		latency_seconds = 0,
+	}
+	return self
+end
+
+function gateway:_wait_for_budget(request_type: Enum.DataStoreRequestType, timeout_seconds: number): boolean
+	local deadline = os.clock() + timeout_seconds
+	repeat
+		local ok, budget = pcall(data_store_service.GetRequestBudgetForRequestType, data_store_service, request_type)
+		if ok and budget > 0 then
+			return true
+		end
+		self.metrics.budget_waits += 1
+		task.wait(0.1)
+	until os.clock() >= deadline
+	return false
+end
+
+function gateway:_run(kind: string, attempts: number, callback: () -> any)
+	local request_type = request_types[kind]
+	for attempt = 1, attempts do
+		if not self:_wait_for_budget(request_type, config.budget_wait_seconds) then
+			self.metrics.failures += 1
+			return false, "budget_timeout"
+		end
+
+		local started_at = os.clock()
+		local packed = table.pack(pcall(callback))
+		self.metrics.latency_seconds += os.clock() - started_at
+		if packed[1] then
+			return true, table.unpack(packed, 2, packed.n)
+		end
+
+		self.metrics.failures += 1
+		if attempt < attempts then
+			self.metrics.retries += 1
+			task.wait(retry_delay(attempt))
+		end
+	end
+	return false, "retry_exhausted"
+end
+
+function gateway:update(store: GlobalDataStore, key: string, callback: (any) -> any, attempts: number?)
+	self.metrics.updates += 1
+	return self:_run("update", attempts or config.write_attempts, function()
+		return store:UpdateAsync(key, callback)
+	end)
+end
+
+function gateway:get(store: GlobalDataStore, key: string, attempts: number?)
+	self.metrics.gets += 1
+	return self:_run("get", attempts or config.read_attempts, function()
+		return store:GetAsync(key)
+	end)
+end
+
+function gateway:remove(store: GlobalDataStore, key: string)
+	self.metrics.removes += 1
+	return self:_run("remove", config.write_attempts, function()
+		return store:RemoveAsync(key)
+	end)
+end
+
+function gateway:list_keys(store: DataStore, prefix: string, page_size: number)
+	self.metrics.lists += 1
+	return self:_run("list", config.read_attempts, function()
+		return store:ListKeysAsync(prefix, page_size)
+	end)
+end
+
+function gateway:snapshot_metrics(): metrics
+	return table.clone(self.metrics)
+end
+
+return gateway

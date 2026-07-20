@@ -1,0 +1,217 @@
+--!strict
+
+local config = require(script.Parent.Parent.shared:WaitForChild("trading_config (module)"))
+local protocol = require(script.Parent:WaitForChild("trade_protocol (module)"))
+local schema = require(script.Parent.Parent.shared:WaitForChild("trading_schema (module)"))
+
+local verification = {}
+
+verification.last_report = {
+	passed = false,
+	passed_count = 0,
+	failed_count = 0,
+	tests = {},
+}
+
+local function expect(condition: boolean, message: string)
+	if not condition then
+		error(message, 2)
+	end
+end
+
+local function new_transaction()
+	return {
+		schema_version = config.transaction_schema_version,
+		protocol_revision = config.protocol_revision,
+		id = "trade_00000000000000000000000000000000",
+		state = "prepared",
+		users = { 1001, 1002 },
+		outgoing = {
+			["1001"] = {},
+			["1002"] = {},
+		},
+		created_at = 1,
+		updated_at = 1,
+		server_id = "test",
+		progress = {
+			prepared = {},
+			applied = {},
+			recovery_count = 0,
+			last_error = "",
+		},
+	}
+end
+
+local function new_protocol_model(fail_prepare_user_id: number?)
+	local transaction = new_transaction()
+	local model = {
+		transaction = transaction,
+		prepared = {},
+		applied = {},
+		rolled_back = {},
+	}
+	local ops = {
+		create = function(candidate)
+			model.transaction = candidate
+			return true, candidate
+		end,
+		prepare = function(user_id)
+			if user_id == fail_prepare_user_id then
+				return false, "injected_prepare_failure"
+			end
+			model.prepared[tostring(user_id)] = true
+			return true
+		end,
+		rollback = function(user_id)
+			model.rolled_back[tostring(user_id)] = true
+			return true
+		end,
+		apply = function(user_id)
+			model.applied[tostring(user_id)] = true
+			return true
+		end,
+		mark_progress = function(_, section, user_id, value)
+			model.transaction.progress[section][tostring(user_id)] = value
+			return true
+		end,
+		transition = function(_, allowed_from, next_state)
+			if not allowed_from[model.transaction.state] and model.transaction.state ~= next_state then
+				return nil, "invalid_transition"
+			end
+			model.transaction.state = next_state
+			return model.transaction
+		end,
+	}
+	return model, ops
+end
+
+local function execute_completes()
+	local model, ops = new_protocol_model(nil)
+	local ok = protocol.execute(model.transaction, ops)
+	expect(ok, "valid transaction did not complete")
+	expect(model.transaction.state == "completed", "transaction did not reach completed")
+	expect(model.applied["1001"] and model.applied["1002"], "both inventories were not applied")
+end
+
+local function prepare_failure_aborts()
+	local model, ops = new_protocol_model(1002)
+	local ok = protocol.execute(model.transaction, ops)
+	expect(not ok, "injected prepare failure unexpectedly completed")
+	expect(model.transaction.state == "aborted", "prepare failure did not abort")
+	expect(model.rolled_back["1001"] == true, "prepared participant was not rolled back")
+	expect(model.applied["1001"] == nil and model.applied["1002"] == nil, "aborted transaction applied inventory")
+end
+
+local function recovery_finishes_committing()
+	local model, ops = new_protocol_model(nil)
+	model.transaction.state = "committing"
+	model.transaction.progress.prepared["1001"] = true
+	model.transaction.progress.prepared["1002"] = true
+	model.transaction.progress.applied["1001"] = true
+	local ok = protocol.recover(model.transaction, ops)
+	expect(ok, "committing recovery failed")
+	expect(model.transaction.state == "completed", "recovery did not complete")
+	expect(model.applied["1001"] == nil, "already-applied side ran twice")
+	expect(model.applied["1002"] == true, "missing side was not applied")
+end
+
+local function request_contract_rejects_unknown_fields()
+	local request = {
+		version = 1,
+		session = "bootstrap_session",
+		sequence = 0,
+		request_id = "request_00000000",
+		action = "bootstrap",
+		payload = { exploit = true },
+	}
+	local normalized = schema.validate_request(request)
+	expect(normalized == nil, "unknown payload field was accepted")
+end
+
+local function request_contract_normalizes_offer()
+	local request = {
+		version = 1,
+		session = "session_00000000000000000000000000000000",
+		sequence = 1,
+		request_id = "request_00000000",
+		action = "set_offer",
+		payload = {
+			trade_id = "trade_00000000000000000000000000000000",
+			expected_revision = 0,
+			item_ids = { "item_00000000000000000000000000000000", "item_00000000000000000000000000000001" },
+		},
+	}
+	local normalized, reason = schema.validate_request(request)
+	expect(normalized ~= nil, reason or "valid offer rejected")
+	expect(normalized.payload.item_ids[1] < normalized.payload.item_ids[2], "offer ids were not deterministic")
+end
+
+local test_cases = {
+	{ name = "execute_completes", run = execute_completes },
+	{ name = "prepare_failure_aborts", run = prepare_failure_aborts },
+	{ name = "recovery_finishes_committing", run = recovery_finishes_committing },
+	{ name = "request_contract_rejects_unknown_fields", run = request_contract_rejects_unknown_fields },
+	{ name = "request_contract_normalizes_offer", run = request_contract_normalizes_offer },
+}
+
+function verification.run_all()
+	local report = {
+		passed = true,
+		passed_count = 0,
+		failed_count = 0,
+		tests = {},
+		started_at = os.time(),
+		finished_at = 0,
+	}
+	for _, test_case in ipairs(test_cases) do
+		local started_at = os.clock()
+		local ok, test_error = xpcall(test_case.run, debug.traceback)
+		table.insert(report.tests, {
+			name = test_case.name,
+			passed = ok,
+			error = ok and nil or tostring(test_error),
+			duration_seconds = os.clock() - started_at,
+		})
+		if ok then
+			report.passed_count += 1
+		else
+			report.passed = false
+			report.failed_count += 1
+		end
+	end
+	report.finished_at = os.time()
+	verification.last_report = report
+	return report.passed, report
+end
+
+function verification.run_lease_load_test(player_count: any, budget: any, duration_seconds: any)
+	if
+		type(player_count) ~= "number"
+		or player_count % 1 ~= 0
+		or player_count < 1
+		or player_count > 500
+		or type(budget) ~= "number"
+		or budget % 1 ~= 0
+		or budget < 0
+		or budget > 1000
+		or type(duration_seconds) ~= "number"
+		or duration_seconds % 1 ~= 0
+		or duration_seconds < 60
+		or duration_seconds > 3600
+	then
+		return false, "invalid_load_test_parameters"
+	end
+
+	local refreshes_per_player = math.ceil(duration_seconds / config.lease_refresh_seconds)
+	local required_updates = player_count * refreshes_per_player
+	local available_updates = budget * duration_seconds
+	return true, {
+		players = player_count,
+		duration_seconds = duration_seconds,
+		required_updates = required_updates,
+		available_updates = available_updates,
+		budget_sufficient = available_updates >= required_updates,
+	}
+end
+
+return verification

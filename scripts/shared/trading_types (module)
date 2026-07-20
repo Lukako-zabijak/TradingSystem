@@ -1,0 +1,68 @@
+--!strict
+
+export type item = {
+	id: string,
+	kind: string,
+	name: string,
+	tradable: boolean,
+	metadata: { [any]: any },
+	created_at: number,
+}
+
+export type lease = {
+	owner: string,
+	token: string,
+	expires_at: number,
+}
+
+export type inventory_record = {
+	schema_version: number,
+	user_id: number,
+	revision: number,
+	items: { [string]: item },
+	settings: { trading_enabled: boolean },
+	pending_transaction: string?,
+	receipts: { [string]: number },
+	mutation_receipts: { [string]: number },
+	lease: lease,
+	updated_at: number,
+}
+
+export type transaction = {
+	schema_version: number,
+	protocol_revision: number,
+	id: string,
+	state: "prepared" | "committing" | "completed" | "aborted",
+	users: { number },
+	outgoing: { [string]: { item } },
+	created_at: number,
+	updated_at: number,
+	server_id: string,
+	progress: {
+		prepared: { [string]: boolean },
+		applied: { [string]: boolean },
+		recovery_count: number,
+		last_error: string,
+	},
+	terminal_at: number?,
+}
+
+export type player_session = {
+	player: Player,
+	user_id: number,
+	lease_token: string,
+	record: inventory_record?,
+	ready: boolean,
+	active: boolean,
+	locked: boolean,
+	unlocked: BindableEvent,
+	buckets: { [string]: { tokens: number, updated_at: number } },
+	request_cache: { [string]: any },
+	request_order: { string },
+	remote_session: string,
+	last_sequence: number,
+	security_score: number,
+	security_updated_at: number,
+}
+
+return table.freeze({})

@@ -1,0 +1,125 @@
+--!strict
+
+local data_store_service = game:GetService("DataStoreService")
+local messaging_service = game:GetService("MessagingService")
+
+local config = require(script.Parent.Parent.shared:WaitForChild("trading_config (module)"))
+local utility = require(script.Parent.Parent.shared:WaitForChild("trading_utility (module)"))
+
+local observability = {}
+observability.__index = observability
+
+function observability.new(gateway: any, changed_event: BindableEvent)
+	local self = setmetatable({}, observability)
+	self.gateway = gateway
+	self.changed_event = changed_event
+	self.alert_store = data_store_service:GetDataStore(config.alert_store_name)
+	self.audit_store = data_store_service:GetDataStore(config.audit_store_name)
+	self.alert_dedupe = {}
+	self.recent_alerts = {}
+	self.metrics = {
+		started_at = os.time(),
+		alerts_emitted = 0,
+		commits_started = 0,
+		commits_completed = 0,
+		commits_recovered = 0,
+		commits_failed = 0,
+		remote_rejections = 0,
+	}
+	return self
+end
+
+function observability:emit_alert(code: string, severity: string, context: any, dedupe_key: string?)
+	local now = os.time()
+	local key = dedupe_key or code
+	if self.alert_dedupe[key] and now - self.alert_dedupe[key] < 30 then
+		return
+	end
+	self.alert_dedupe[key] = now
+
+	local alert = {
+		id = utility.new_id("alert_"),
+		code = code,
+		severity = severity,
+		context = utility.deep_copy(context),
+		server_id = game.JobId,
+		created_at = now,
+	}
+	self.metrics.alerts_emitted += 1
+	table.insert(self.recent_alerts, utility.deep_copy(alert))
+	while #self.recent_alerts > 100 do
+		table.remove(self.recent_alerts, 1)
+	end
+	self.changed_event:Fire("alert", utility.deep_copy(alert))
+
+	task.spawn(function()
+		local ok = self.gateway:update(self.alert_store, "recent", function(current)
+			local alerts = type(current) == "table" and current or {}
+			for _, existing in ipairs(alerts) do
+				if existing.id == alert.id then
+					return alerts
+				end
+			end
+			table.insert(alerts, alert)
+			while #alerts > 100 do
+				table.remove(alerts, 1)
+			end
+			return alerts
+		end)
+		if not ok then
+			warn(string.format("[trading/alert] persistence failed code=%s", code))
+		end
+		pcall(messaging_service.PublishAsync, messaging_service, config.alert_topic, alert)
+	end)
+end
+
+function observability:get_durable_alerts()
+	local ok, alerts_or_error = self.gateway:get(self.alert_store, "recent")
+	if not ok then
+		return false, alerts_or_error
+	end
+	if type(alerts_or_error) ~= "table" then
+		return true, {}
+	end
+	return true, utility.deep_copy(alerts_or_error)
+end
+
+function observability:append_audit(transaction_id: string, event_name: string, details: any)
+	local event_id = utility.new_id("event_")
+	local key = "audit_" .. transaction_id
+	task.spawn(function()
+		local ok = self.gateway:update(self.audit_store, key, function(current)
+			local record = type(current) == "table" and current or { events = {} }
+			for _, event in ipairs(record.events) do
+				if event.id == event_id then
+					return record
+				end
+			end
+			table.insert(record.events, {
+				id = event_id,
+				name = event_name,
+				details = utility.deep_copy(details),
+				created_at = os.time(),
+			})
+			while #record.events > 64 do
+				table.remove(record.events, 1)
+			end
+			return record
+		end)
+		if not ok then
+			self:emit_alert("audit_write_failed", "warning", {
+				transaction_id = transaction_id,
+				event_name = event_name,
+			}, "audit:" .. transaction_id)
+		end
+	end)
+end
+
+function observability:snapshot()
+	return {
+		service = table.clone(self.metrics),
+		data_store = self.gateway:snapshot_metrics(),
+	}
+end
+
+return observability

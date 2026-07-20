@@ -1,0 +1,132 @@
+--!strict
+
+local http_service = game:GetService("HttpService")
+
+local utility = {}
+
+function utility.new_id(prefix: string): string
+	return prefix .. string.lower(string.gsub(http_service:GenerateGUID(false), "%-", ""))
+end
+
+function utility.is_finite_number(value: any): boolean
+	return type(value) == "number" and value == value and value > -math.huge and value < math.huge
+end
+
+function utility.is_integer(value: any): boolean
+	return utility.is_finite_number(value) and value % 1 == 0
+end
+
+function utility.is_safe_integer(value: any): boolean
+	return utility.is_integer(value) and math.abs(value) <= 9007199254740991
+end
+
+function utility.is_valid_utf8(value: any): boolean
+	return type(value) == "string" and utf8.len(value) ~= nil
+end
+
+function utility.is_safe_identifier(value: any, minimum: number, maximum: number): boolean
+	if not utility.is_valid_utf8(value) then
+		return false
+	end
+	if #value < minimum or #value > maximum then
+		return false
+	end
+	return string.match(value, "^[%w_%.:%-]+$") ~= nil
+end
+
+function utility.is_trade_id(value: any): boolean
+	return type(value) == "string" and #value == 38 and string.match(value, "^trade_[%x]+$") ~= nil
+end
+
+function utility.is_mutation_id(value: any): boolean
+	return type(value) == "string" and #value == 36 and string.match(value, "^mut_[%x]+$") ~= nil
+end
+
+function utility.deep_copy(value: any, seen: { [any]: any }?): any
+	if type(value) ~= "table" then
+		return value
+	end
+
+	local visited = seen or {}
+	if visited[value] ~= nil then
+		return visited[value]
+	end
+
+	local copy = {}
+	visited[value] = copy
+	for key, child in pairs(value) do
+		copy[utility.deep_copy(key, visited)] = utility.deep_copy(child, visited)
+	end
+	return copy
+end
+
+function utility.deep_equal(left: any, right: any, seen: { [any]: any }?): boolean
+	if left == right then
+		return true
+	end
+	if type(left) ~= "table" or type(right) ~= "table" then
+		return false
+	end
+
+	local visited = seen or {}
+	if visited[left] == right then
+		return true
+	end
+	visited[left] = right
+
+	for key, value in pairs(left) do
+		if not utility.deep_equal(value, right[key], visited) then
+			return false
+		end
+	end
+	for key in pairs(right) do
+		if left[key] == nil then
+			return false
+		end
+	end
+	return true
+end
+
+function utility.has_only_keys(value: any, allowed: { [string]: boolean }, maximum: number): boolean
+	if type(value) ~= "table" then
+		return false
+	end
+
+	local count = 0
+	for key in pairs(value) do
+		count += 1
+		if count > maximum or type(key) ~= "string" or not allowed[key] then
+			return false
+		end
+	end
+	return true
+end
+
+function utility.prune_receipts(receipts: { [string]: number }, protected_id: string, maximum: number)
+	local entries = {}
+	for id, timestamp in pairs(receipts) do
+		table.insert(entries, { id = id, timestamp = timestamp })
+	end
+	if #entries <= maximum then
+		return
+	end
+
+	table.sort(entries, function(left, right)
+		if left.id == protected_id then
+			return false
+		end
+		if right.id == protected_id then
+			return true
+		end
+		if left.timestamp == right.timestamp then
+			return left.id < right.id
+		end
+		return left.timestamp < right.timestamp
+	end)
+
+	for index = 1, #entries - maximum do
+		receipts[entries[index].id] = nil
+	end
+end
+
+return table.freeze(utility)

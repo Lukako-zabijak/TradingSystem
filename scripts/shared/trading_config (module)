@@ -1,0 +1,73 @@
+--!strict
+
+local config = {
+	protocol_version = 1,
+	inventory_schema_version = 2,
+	transaction_schema_version = 2,
+	protocol_revision = 1,
+
+	inventory_store_name = "hardened_trade_inventory_v1",
+	transaction_store_name = "hardened_trade_transactions_v1",
+	audit_store_name = "hardened_trade_audit_v1",
+	alert_store_name = "hardened_trade_alerts_v1",
+	open_transaction_store_name = "hardened_trade_open_v1",
+	recovery_topic = "hardened_trade_recovery_v1",
+	alert_topic = "hardened_trade_alerts_v1",
+
+	remote_folder_name = "trading",
+	request_remote_name = "request",
+	push_remote_name = "push",
+	server_api_folder_name = "trading_server_api",
+
+	lease_seconds = 120,
+	lease_refresh_seconds = 35,
+	lease_retry_seconds = 5,
+	lease_budget_reserve = 8,
+	maximum_lease_refreshes_per_tick = 24,
+
+	load_attempts = 7,
+	write_attempts = 6,
+	read_attempts = 5,
+	budget_wait_seconds = 8,
+
+	maximum_inventory_items = 500,
+	maximum_offer_items = 20,
+	maximum_item_id_bytes = 72,
+	maximum_kind_bytes = 64,
+	maximum_name_bytes = 96,
+	maximum_metadata_bytes = 2048,
+	maximum_metadata_nodes = 96,
+	maximum_metadata_depth = 5,
+	maximum_receipts = 64,
+	maximum_mutation_receipts = 64,
+
+	invite_lifetime_seconds = 30,
+	trade_lifetime_seconds = 300,
+	transaction_sweep_seconds = 45,
+	transaction_recovery_age_seconds = 75,
+	request_cache_size = 32,
+	request_cache_seconds = 45,
+	minimum_account_age_days = 7,
+	require_proximity = false,
+	maximum_trade_distance = 80,
+	security_kick_score = 24,
+	global_bucket_capacity = 24,
+	global_bucket_refill_per_second = 8,
+}
+
+config.action_limits = {
+	bootstrap = { capacity = 2, refill = 0.5 },
+	invite = { capacity = 2, refill = 0.2 },
+	respond = { capacity = 4, refill = 1 },
+	set_offer = { capacity = 8, refill = 3 },
+	confirm = { capacity = 4, refill = 1 },
+	cancel = { capacity = 4, refill = 1 },
+	sync = { capacity = 2, refill = 0.5 },
+}
+
+for _, limit in pairs(config.action_limits) do
+	table.freeze(limit)
+end
+
+table.freeze(config.action_limits)
+return table.freeze(config)

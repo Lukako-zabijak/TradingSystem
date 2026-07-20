@@ -1,0 +1,373 @@
+--!strict
+
+local data_store_service = game:GetService("DataStoreService")
+
+local config = require(script.Parent.Parent.shared:WaitForChild("trading_config (module)"))
+local schema = require(script.Parent.Parent.shared:WaitForChild("trading_schema (module)"))
+local utility = require(script.Parent.Parent.shared:WaitForChild("trading_utility (module)"))
+
+local repository = {}
+repository.__index = repository
+
+local function inventory_key(user_id: number): string
+	return "user_" .. tostring(user_id)
+end
+
+function repository.new(gateway: any, server_id: string, observability: any)
+	local self = setmetatable({}, repository)
+	self.gateway = gateway
+	self.server_id = server_id
+	self.observability = observability
+	self.store = data_store_service:GetDataStore(config.inventory_store_name)
+	return self
+end
+
+function repository:lock(session: any)
+	while session.locked do
+		session.unlocked.Event:Wait()
+	end
+	session.locked = true
+end
+
+function repository:unlock(session: any)
+	session.locked = false
+	session.unlocked:Fire()
+end
+
+function repository:with_lock(session: any, callback: () -> ...any)
+	self:lock(session)
+	local packed = table.pack(xpcall(callback, debug.traceback))
+	self:unlock(session)
+	if not packed[1] then
+		error(packed[2], 0)
+	end
+	return table.unpack(packed, 2, packed.n)
+end
+
+function repository:acquire(session: any)
+	local now = os.time()
+	local normalized_error = nil
+	local ok, saved_or_error = self.gateway:update(self.store, inventory_key(session.user_id), function(current)
+		local record, reason = schema.normalize_inventory(current, session.user_id)
+		if record == nil then
+			normalized_error = reason
+			error(reason)
+		end
+		if record.lease.owner ~= "" and record.lease.expires_at > now then
+			return nil
+		end
+		record.lease = {
+			owner = self.server_id,
+			token = session.lease_token,
+			expires_at = now + config.lease_seconds,
+		}
+		record.updated_at = now
+		return record
+	end, config.load_attempts)
+	if not ok then
+		return false, normalized_error or saved_or_error
+	end
+	if saved_or_error == nil then
+		return false, "lease_busy"
+	end
+
+	local record, reason = schema.normalize_inventory(saved_or_error, session.user_id)
+	if record == nil then
+		return false, reason
+	end
+	session.record = record
+	return true
+end
+
+function repository:refresh(session: any)
+	if session.record == nil then
+		return false, "not_loaded"
+	end
+	local now = os.time()
+	local lease_lost = false
+	local ok, saved_or_error = self.gateway:update(self.store, inventory_key(session.user_id), function(current)
+		local record = schema.normalize_inventory(current, session.user_id)
+		if record == nil then
+			lease_lost = true
+			return nil
+		end
+		if record.lease.owner ~= self.server_id or record.lease.token ~= session.lease_token then
+			lease_lost = true
+			return nil
+		end
+		record.lease.expires_at = now + config.lease_seconds
+		record.updated_at = now
+		return record
+	end)
+	if not ok then
+		return false, saved_or_error
+	end
+	if lease_lost or saved_or_error == nil then
+		return false, "lease_lost"
+	end
+	session.record = schema.normalize_inventory(saved_or_error, session.user_id)
+	return session.record ~= nil, session.record ~= nil and nil or "invalid_saved_record"
+end
+
+function repository:release(session: any)
+	if session.record == nil then
+		return true
+	end
+	local ok, saved_or_error = self.gateway:update(self.store, inventory_key(session.user_id), function(current)
+		local record = schema.normalize_inventory(current, session.user_id)
+		if record == nil then
+			return nil
+		end
+		if record.lease.owner ~= self.server_id or record.lease.token ~= session.lease_token then
+			return record
+		end
+		record.lease = { owner = "", token = "", expires_at = 0 }
+		record.updated_at = os.time()
+		return record
+	end)
+	if ok and saved_or_error ~= nil then
+		session.record = schema.normalize_inventory(saved_or_error, session.user_id)
+	end
+	return ok, ok and nil or saved_or_error
+end
+
+function repository:mutate(session: any, mutator: (any) -> (boolean, any))
+	return self:with_lock(session, function()
+		if not session.active or not session.ready or session.record == nil then
+			return false, "not_ready"
+		end
+		if session.record.pending_transaction ~= nil then
+			return false, "inventory_recovering"
+		end
+
+		local expected_revision = session.record.revision
+		local mutation_id = utility.new_id("mut_")
+		local desired = utility.deep_copy(session.record)
+		local changed, result = mutator(desired)
+		if not changed then
+			return false, result
+		end
+		desired.revision += 1
+		desired.updated_at = os.time()
+		desired.mutation_receipts[mutation_id] = os.time()
+		utility.prune_receipts(desired.mutation_receipts, mutation_id, config.maximum_mutation_receipts)
+
+		local conflict = false
+		local lease_lost = false
+		local function apply_mutation(current)
+			local record = schema.normalize_inventory(current, session.user_id)
+			if record == nil then
+				return nil
+			end
+			if record.lease.owner ~= self.server_id or record.lease.token ~= session.lease_token then
+				lease_lost = true
+				return nil
+			end
+			if record.mutation_receipts[mutation_id] ~= nil then
+				return record
+			end
+			if record.revision ~= expected_revision or record.pending_transaction ~= nil then
+				conflict = true
+				return nil
+			end
+			desired.lease = utility.deep_copy(record.lease)
+			return desired
+		end
+		local ok, saved_or_error = self.gateway:update(self.store, inventory_key(session.user_id), apply_mutation)
+		if not ok then
+			ok, saved_or_error = self.gateway:update(self.store, inventory_key(session.user_id), apply_mutation)
+		end
+		if not ok then
+			return false, saved_or_error
+		end
+		if lease_lost then
+			return false, "lease_lost"
+		end
+		if conflict or saved_or_error == nil then
+			return false, "revision_conflict"
+		end
+		session.record = schema.normalize_inventory(saved_or_error, session.user_id)
+		return true, result
+	end)
+end
+
+function repository:prepare(session: any, transaction: any)
+	return self:with_lock(session, function()
+		if not session.active or not session.ready or session.record == nil then
+			return false, "not_ready"
+		end
+		if session.record.pending_transaction ~= nil then
+			return false, "inventory_busy"
+		end
+
+		local expected_revision = session.record.revision
+		local outgoing = transaction.outgoing[tostring(session.user_id)]
+		for _, item in ipairs(outgoing) do
+			local owned = session.record.items[item.id]
+			if owned == nil or not owned.tradable or not utility.deep_equal(owned, item) then
+				return false, "offer_changed"
+			end
+		end
+
+		local conflict = false
+		local ok, saved_or_error = self.gateway:update(self.store, inventory_key(session.user_id), function(current)
+			local record = schema.normalize_inventory(current, session.user_id)
+			if
+				record == nil
+				or record.lease.owner ~= self.server_id
+				or record.lease.token ~= session.lease_token
+				or record.revision ~= expected_revision
+				or record.pending_transaction ~= nil
+			then
+				conflict = true
+				return nil
+			end
+			for _, item in ipairs(outgoing) do
+				if not utility.deep_equal(record.items[item.id], item) then
+					conflict = true
+					return nil
+				end
+			end
+			record.pending_transaction = transaction.id
+			record.updated_at = os.time()
+			return record
+		end)
+		if not ok then
+			return false, saved_or_error
+		end
+		if conflict or saved_or_error == nil then
+			return false, "prepare_conflict"
+		end
+		session.record = schema.normalize_inventory(saved_or_error, session.user_id)
+		return true
+	end)
+end
+
+function repository:rollback(session: any, transaction_id: string)
+	return self:with_lock(session, function()
+		local ok, saved_or_error = self.gateway:update(self.store, inventory_key(session.user_id), function(current)
+			local record = schema.normalize_inventory(current, session.user_id)
+			if record == nil then
+				return nil
+			end
+			if record.pending_transaction == transaction_id then
+				record.pending_transaction = nil
+				record.updated_at = os.time()
+			end
+			return record
+		end)
+		if ok and saved_or_error ~= nil then
+			session.record = schema.normalize_inventory(saved_or_error, session.user_id)
+		end
+		return ok, ok and nil or saved_or_error
+	end)
+end
+
+function repository:rollback_user(user_id: number, transaction_id: string, session: any?)
+	if session ~= nil then
+		return self:rollback(session, transaction_id)
+	end
+	local denied_reason = nil
+	local ok, saved_or_error = self.gateway:update(self.store, inventory_key(user_id), function(current)
+		local record = schema.normalize_inventory(current, user_id)
+		if record == nil then
+			return nil
+		end
+		if record.lease.owner ~= "" and record.lease.expires_at > os.time() then
+			denied_reason = "lease_busy"
+			return nil
+		end
+		if record.pending_transaction == transaction_id then
+			record.pending_transaction = nil
+			record.updated_at = os.time()
+		end
+		return record
+	end)
+	if not ok then
+		return false, saved_or_error
+	end
+	if saved_or_error == nil then
+		return false, denied_reason or "rollback_rejected"
+	end
+	return true
+end
+
+function repository:apply_transaction(transaction: any, user_id: number, session: any?)
+	local outgoing = transaction.outgoing[tostring(user_id)]
+	local other_user_id = transaction.users[1] == user_id and transaction.users[2] or transaction.users[1]
+	local incoming = transaction.outgoing[tostring(other_user_id)]
+	local denied_reason = nil
+
+	local ok, saved_or_error = self.gateway:update(self.store, inventory_key(user_id), function(current)
+		local record, reason = schema.normalize_inventory(current, user_id)
+		if record == nil then
+			denied_reason = reason
+			return nil
+		end
+		if record.receipts[transaction.id] ~= nil then
+			if record.pending_transaction == transaction.id then
+				record.pending_transaction = nil
+			end
+			return record
+		end
+		if record.pending_transaction ~= transaction.id then
+			denied_reason = "transaction_not_prepared"
+			return nil
+		end
+		if session ~= nil then
+			if record.lease.owner ~= self.server_id or record.lease.token ~= session.lease_token then
+				denied_reason = "lease_lost"
+				return nil
+			end
+		elseif record.lease.owner ~= "" and record.lease.expires_at > os.time() then
+			denied_reason = "lease_busy"
+			return nil
+		end
+
+		for _, item in ipairs(outgoing) do
+			if not utility.deep_equal(record.items[item.id], item) then
+				denied_reason = "outgoing_item_changed"
+				return nil
+			end
+		end
+		for _, item in ipairs(incoming) do
+			if record.items[item.id] ~= nil then
+				denied_reason = "incoming_item_collision"
+				return nil
+			end
+		end
+
+		for _, item in ipairs(outgoing) do
+			record.items[item.id] = nil
+		end
+		for _, item in ipairs(incoming) do
+			record.items[item.id] = utility.deep_copy(item)
+		end
+		record.pending_transaction = nil
+		record.receipts[transaction.id] = os.time()
+		utility.prune_receipts(record.receipts, transaction.id, config.maximum_receipts)
+		record.revision += 1
+		record.updated_at = os.time()
+		return record
+	end)
+	if not ok then
+		return false, saved_or_error
+	end
+	if saved_or_error == nil then
+		return false, denied_reason or "apply_rejected"
+	end
+	if session ~= nil then
+		session.record = schema.normalize_inventory(saved_or_error, user_id)
+	end
+	return true
+end
+
+function repository:read(user_id: number)
+	local ok, raw_or_error = self.gateway:get(self.store, inventory_key(user_id))
+	if not ok then
+		return nil, raw_or_error
+	end
+	return schema.normalize_inventory(raw_or_error, user_id)
+end
+
+return repository

@@ -1,0 +1,745 @@
+--!strict
+
+local data_store_service = game:GetService("DataStoreService")
+local messaging_service = game:GetService("MessagingService")
+local players = game:GetService("Players")
+
+local config = require(script.Parent.Parent.shared:WaitForChild("trading_config (module)"))
+local schema = require(script.Parent.Parent.shared:WaitForChild("trading_schema (module)"))
+local utility = require(script.Parent.Parent.shared:WaitForChild("trading_utility (module)"))
+
+local service = {}
+service.__index = service
+
+function service.new(inventory_repository: any, transaction_repository: any, coordinator: any, observability: any)
+	local self = setmetatable({}, service)
+	self.inventory_repository = inventory_repository
+	self.transaction_repository = transaction_repository
+	self.coordinator = coordinator
+	self.observability = observability
+	self.sessions = {}
+	self.trades = {}
+	self.user_trade = {}
+	self.connections = {}
+	self.push_remote = nil
+	self.running = false
+	self.stopping = false
+	self.coordinator:set_session_lookup(self.sessions)
+	return self
+end
+
+function service:set_push_remote(push_remote: RemoteEvent)
+	self.push_remote = push_remote
+end
+
+function service:get_session(user_id: number)
+	return self.sessions[user_id]
+end
+
+function service:_send(player: Player, kind: string, data: any)
+	if self.push_remote == nil or player.Parent ~= players then
+		return
+	end
+	self.push_remote:FireClient(player, {
+		version = config.protocol_version,
+		kind = kind,
+		data = data,
+		server_time = os.time(),
+	})
+end
+
+function service:_push_inventory(session: any, reason: string)
+	if session.record == nil then
+		return
+	end
+	self:_send(session.player, "inventory", {
+		reason = reason,
+		session = session.remote_session,
+		next_sequence = session.last_sequence + 1,
+		inventory = schema.inventory_snapshot(session.record),
+	})
+end
+
+function service:_trade_snapshot(trade: any)
+	return {
+		id = trade.id,
+		status = trade.status,
+		users = { trade.users[1], trade.users[2] },
+		inviter_user_id = trade.inviter_user_id,
+		revision = trade.revision,
+		offers = {
+			[tostring(trade.users[1])] = utility.deep_copy(trade.offers[tostring(trade.users[1])].public),
+			[tostring(trade.users[2])] = utility.deep_copy(trade.offers[tostring(trade.users[2])].public),
+		},
+		confirmed = utility.deep_copy(trade.confirmed),
+		created_at = trade.created_at,
+		expires_at = trade.expires_at,
+	}
+end
+
+function service:_push_trade(trade: any, kind: string, details: any?)
+	local snapshot = self:_trade_snapshot(trade)
+	for _, user_id in ipairs(trade.users) do
+		local session = self.sessions[user_id]
+		if session ~= nil then
+			self:_send(session.player, kind, {
+				trade = snapshot,
+				details = details,
+			})
+		end
+	end
+end
+
+function service:_close_trade(trade: any, reason: string)
+	if self.trades[trade.id] ~= trade then
+		return
+	end
+	trade.status = "closed"
+	self:_push_trade(trade, "trade_closed", { reason = reason })
+	for _, user_id in ipairs(trade.users) do
+		if self.user_trade[user_id] == trade.id then
+			self.user_trade[user_id] = nil
+		end
+	end
+	self.trades[trade.id] = nil
+	self.observability.changed_event:Fire("trade_closed", {
+		trade_id = trade.id,
+		reason = reason,
+	})
+end
+
+function service:_valid_proximity(left_player: Player, right_player: Player): boolean
+	if not config.require_proximity then
+		return true
+	end
+	local left_character = left_player.Character
+	local right_character = right_player.Character
+	local left_root = left_character and left_character:FindFirstChild("HumanoidRootPart")
+	local right_root = right_character and right_character:FindFirstChild("HumanoidRootPart")
+	if not left_root or not right_root or not left_root:IsA("BasePart") or not right_root:IsA("BasePart") then
+		return false
+	end
+	return (left_root.Position - right_root.Position).Magnitude <= config.maximum_trade_distance
+end
+
+function service:bootstrap(session: any)
+	local trade = nil
+	local trade_id = self.user_trade[session.user_id]
+	if trade_id ~= nil and self.trades[trade_id] ~= nil then
+		trade = self:_trade_snapshot(self.trades[trade_id])
+	end
+	return true, "bootstrapped", {
+		session = session.remote_session,
+		next_sequence = session.last_sequence + 1,
+		inventory = session.ready and session.record and schema.inventory_snapshot(session.record) or nil,
+		trade = trade,
+	}
+end
+
+function service:_invite(session: any, payload: any)
+	if payload.target_user_id == session.user_id then
+		return false, "cannot_trade_self"
+	end
+	if self.user_trade[session.user_id] ~= nil then
+		return false, "already_trading"
+	end
+
+	local target_player = players:GetPlayerByUserId(payload.target_user_id)
+	local target_session = target_player and self.sessions[target_player.UserId]
+	if target_session == nil or not target_session.active or not target_session.ready or target_session.record == nil then
+		return false, "target_unavailable"
+	end
+	if self.user_trade[target_session.user_id] ~= nil then
+		return false, "target_busy"
+	end
+	if session.record == nil or not session.record.settings.trading_enabled or not target_session.record.settings.trading_enabled then
+		return false, "trading_disabled"
+	end
+	if session.player.AccountAge < config.minimum_account_age_days or target_session.player.AccountAge < config.minimum_account_age_days then
+		return false, "account_too_new"
+	end
+	if session.record.pending_transaction ~= nil or target_session.record.pending_transaction ~= nil then
+		return false, "inventory_busy"
+	end
+	if not self:_valid_proximity(session.player, target_session.player) then
+		return false, "too_far_away"
+	end
+
+	local trade_id = utility.new_id("trade_")
+	local now = os.time()
+	local trade = {
+		id = trade_id,
+		status = "pending",
+		users = { session.user_id, target_session.user_id },
+		inviter_user_id = session.user_id,
+		revision = 0,
+		offers = {
+			[tostring(session.user_id)] = { ids = {}, public = {} },
+			[tostring(target_session.user_id)] = { ids = {}, public = {} },
+		},
+		confirmed = {
+			[tostring(session.user_id)] = false,
+			[tostring(target_session.user_id)] = false,
+		},
+		created_at = now,
+		expires_at = now + config.invite_lifetime_seconds,
+	}
+	self.trades[trade_id] = trade
+	self.user_trade[session.user_id] = trade_id
+	self.user_trade[target_session.user_id] = trade_id
+	self:_push_trade(trade, "trade_invited")
+
+	task.delay(config.invite_lifetime_seconds + 1, function()
+		local current = self.trades[trade_id]
+		if current ~= nil and current.status == "pending" and os.time() >= current.expires_at then
+			self:_close_trade(current, "invite_expired")
+		end
+	end)
+	return true, "invite_sent", { trade_id = trade_id }
+end
+
+function service:_respond(session: any, payload: any)
+	local trade = self.trades[payload.trade_id]
+	if trade == nil or not table.find(trade.users, session.user_id) then
+		return false, "trade_not_found"
+	end
+	if trade.status ~= "pending" then
+		return false, "trade_not_pending"
+	end
+	if trade.inviter_user_id == session.user_id then
+		return false, "inviter_cannot_respond"
+	end
+	if not payload.accept then
+		self:_close_trade(trade, "declined")
+		return true, "declined"
+	end
+
+	local inviter_session = self.sessions[trade.inviter_user_id]
+	if inviter_session == nil or not inviter_session.active or not inviter_session.ready then
+		self:_close_trade(trade, "participant_unavailable")
+		return false, "participant_unavailable"
+	end
+	if not self:_valid_proximity(session.player, inviter_session.player) then
+		self:_close_trade(trade, "too_far_away")
+		return false, "too_far_away"
+	end
+
+	trade.status = "active"
+	trade.expires_at = os.time() + config.trade_lifetime_seconds
+	self:_push_trade(trade, "trade_opened")
+	task.delay(config.trade_lifetime_seconds + 1, function()
+		local current = self.trades[trade.id]
+		if current ~= nil and current.status == "active" and os.time() >= current.expires_at then
+			self:_close_trade(current, "trade_expired")
+		end
+	end)
+	return true, "accepted", { trade = self:_trade_snapshot(trade) }
+end
+
+function service:_set_offer(session: any, payload: any)
+	local trade = self.trades[payload.trade_id]
+	if trade == nil or not table.find(trade.users, session.user_id) then
+		return false, "trade_not_found"
+	end
+	if trade.status ~= "active" then
+		return false, "trade_not_active"
+	end
+	if payload.expected_revision ~= trade.revision then
+		return false, "stale_revision", { trade = self:_trade_snapshot(trade) }
+	end
+
+	local left_session = self.sessions[trade.users[1]]
+	local right_session = self.sessions[trade.users[2]]
+	if
+		left_session == nil
+		or right_session == nil
+		or not left_session.ready
+		or not right_session.ready
+		or session.record == nil
+	then
+		self:_close_trade(trade, "participant_unavailable")
+		return false, "participant_unavailable"
+	end
+	if not self:_valid_proximity(left_session.player, right_session.player) then
+		self:_close_trade(trade, "too_far_away")
+		return false, "too_far_away"
+	end
+
+	local public_items = {}
+	for _, item_id in ipairs(payload.item_ids) do
+		local item = session.record.items[item_id]
+		if item == nil then
+			return false, "item_not_owned"
+		end
+		if not item.tradable then
+			return false, "item_not_tradable"
+		end
+		table.insert(public_items, schema.public_item(item))
+	end
+
+	trade.offers[tostring(session.user_id)] = {
+		ids = utility.deep_copy(payload.item_ids),
+		public = public_items,
+	}
+	trade.revision += 1
+	trade.confirmed[tostring(trade.users[1])] = false
+	trade.confirmed[tostring(trade.users[2])] = false
+	self:_push_trade(trade, "trade_updated")
+	return true, "offer_updated", { revision = trade.revision }
+end
+
+function service:_finish_local_commit(trade: any, transaction: any)
+	if self.trades[trade.id] ~= trade then
+		return
+	end
+	for _, user_id in ipairs(transaction.users) do
+		local session = self.sessions[user_id]
+		if session ~= nil and session.record ~= nil then
+			self:_push_inventory(session, "trade_completed")
+		end
+	end
+	self:_close_trade(trade, "completed")
+end
+
+function service:_watch_commit(trade: any)
+	task.spawn(function()
+		local committed, result = self.coordinator:commit(trade)
+		if committed then
+			self:_finish_local_commit(trade, result)
+			return
+		end
+
+		for _ = 1, 20 do
+			task.wait(1.5)
+			local transaction = self.transaction_repository:get(trade.id)
+			if transaction ~= nil and transaction.state == "completed" then
+				for _, user_id in ipairs(transaction.users) do
+					local session = self.sessions[user_id]
+					if session ~= nil then
+						local record = self.inventory_repository:read(user_id)
+						if record ~= nil then
+							session.record = record
+						end
+					end
+				end
+				self:_finish_local_commit(trade, transaction)
+				return
+			elseif transaction ~= nil and transaction.state == "aborted" then
+				self:_close_trade(trade, "commit_aborted")
+				return
+			end
+		end
+		self:_push_trade(trade, "trade_recovering")
+	end)
+end
+
+function service:_confirm(session: any, payload: any)
+	local trade = self.trades[payload.trade_id]
+	if trade == nil or not table.find(trade.users, session.user_id) then
+		return false, "trade_not_found"
+	end
+	if trade.status ~= "active" then
+		return false, "trade_not_active"
+	end
+	if payload.expected_revision ~= trade.revision then
+		return false, "stale_revision", { trade = self:_trade_snapshot(trade) }
+	end
+
+	local left_session = self.sessions[trade.users[1]]
+	local right_session = self.sessions[trade.users[2]]
+	if left_session == nil or right_session == nil or not left_session.ready or not right_session.ready then
+		self:_close_trade(trade, "participant_unavailable")
+		return false, "participant_unavailable"
+	end
+	if not self:_valid_proximity(left_session.player, right_session.player) then
+		self:_close_trade(trade, "too_far_away")
+		return false, "too_far_away"
+	end
+
+	trade.confirmed[tostring(session.user_id)] = true
+	if trade.confirmed[tostring(trade.users[1])] and trade.confirmed[tostring(trade.users[2])] then
+		trade.status = "committing"
+		self:_push_trade(trade, "trade_locked")
+		self:_watch_commit(trade)
+		return true, "commit_started"
+	end
+	self:_push_trade(trade, "trade_updated")
+	return true, "confirmed"
+end
+
+function service:_cancel(session: any, payload: any)
+	local trade = self.trades[payload.trade_id]
+	if trade == nil or not table.find(trade.users, session.user_id) then
+		return false, "trade_not_found"
+	end
+	if trade.status == "committing" then
+		return false, "commit_in_progress"
+	end
+	self:_close_trade(trade, "cancelled")
+	return true, "cancelled"
+end
+
+function service:_sync(session: any)
+	self:_push_inventory(session, "sync")
+	local trade_id = self.user_trade[session.user_id]
+	if trade_id ~= nil and self.trades[trade_id] ~= nil then
+		self:_send(session.player, "trade_sync", { trade = self:_trade_snapshot(self.trades[trade_id]) })
+	end
+	return true, "synchronized", {
+		inventory_revision = session.record and session.record.revision or 0,
+		trade_id = trade_id,
+	}
+end
+
+function service:handle_action(session: any, action: string, payload: any)
+	if action == "bootstrap" then
+		return self:bootstrap(session)
+	elseif action == "invite" then
+		return self:_invite(session, payload)
+	elseif action == "respond" then
+		return self:_respond(session, payload)
+	elseif action == "set_offer" then
+		return self:_set_offer(session, payload)
+	elseif action == "confirm" then
+		return self:_confirm(session, payload)
+	elseif action == "cancel" then
+		return self:_cancel(session, payload)
+	elseif action == "sync" then
+		return self:_sync(session)
+	end
+	return false, "unknown_action"
+end
+
+function service:_new_session(player: Player)
+	return {
+		player = player,
+		user_id = player.UserId,
+		lease_token = utility.new_id("lease_"),
+		record = nil,
+		ready = false,
+		active = true,
+		locked = false,
+		unlocked = Instance.new("BindableEvent"),
+		buckets = {},
+		request_cache = {},
+		request_order = {},
+		remote_session = utility.new_id("session_"),
+		last_sequence = 0,
+		security_score = 0,
+		security_updated_at = os.clock(),
+		next_lease_refresh_at = os.clock() + 5,
+		lease_failures = 0,
+		lease_refreshing = false,
+	}
+end
+
+function service:_load_player(player: Player)
+	if self.sessions[player.UserId] ~= nil then
+		return
+	end
+	local session = self:_new_session(player)
+	self.sessions[player.UserId] = session
+
+	local acquired, acquire_error = self.inventory_repository:acquire(session)
+	if not acquired then
+		session.active = false
+		if player.Parent == players then
+			local message = acquire_error == "lease_busy"
+				and "your inventory is active on another server; please rejoin"
+				or "inventory services are unavailable; please rejoin"
+			player:Kick(message)
+		end
+		return
+	end
+	if not session.active or player.Parent ~= players then
+		self.inventory_repository:release(session)
+		return
+	end
+
+	if session.record ~= nil and session.record.pending_transaction ~= nil then
+		self.coordinator:start_recovery(session.record.pending_transaction)
+		local deadline = os.clock() + 25
+		repeat
+			task.wait(0.25)
+		until session.record.pending_transaction == nil or os.clock() >= deadline or not session.active
+		if session.record.pending_transaction ~= nil then
+			self.inventory_repository:release(session)
+			if player.Parent == players then
+				player:Kick("your inventory is recovering; please rejoin shortly")
+			end
+			return
+		end
+	end
+
+	session.ready = true
+	self:_push_inventory(session, "loaded")
+end
+
+function service:_remove_player(player: Player)
+	local session = self.sessions[player.UserId]
+	if session == nil then
+		return
+	end
+	session.active = false
+	session.ready = false
+
+	local trade_id = self.user_trade[session.user_id]
+	local trade = trade_id and self.trades[trade_id]
+	if trade ~= nil and trade.status ~= "committing" then
+		self:_close_trade(trade, "participant_left")
+	end
+
+	local pending_transaction = session.record and session.record.pending_transaction
+	self.inventory_repository:release(session)
+	if self.sessions[session.user_id] == session then
+		self.sessions[session.user_id] = nil
+	end
+	session.unlocked:Destroy()
+	if pending_transaction ~= nil then
+		self.coordinator:start_recovery(pending_transaction)
+	elseif trade ~= nil and trade.status == "committing" then
+		self.coordinator:start_recovery(trade.id)
+	end
+end
+
+function service:_start_lease_loop()
+	task.spawn(function()
+		while self.running do
+			task.wait(config.lease_retry_seconds)
+			if not self.running then
+				break
+			end
+
+			local budget_ok, budget = pcall(
+				data_store_service.GetRequestBudgetForRequestType,
+				data_store_service,
+				Enum.DataStoreRequestType.UpdateAsync
+			)
+			local capacity = budget_ok
+				and math.min(config.maximum_lease_refreshes_per_tick, math.max(0, budget - config.lease_budget_reserve))
+				or 0
+			local due = {}
+			for _, session in pairs(self.sessions) do
+				if
+					session.active
+					and session.record ~= nil
+					and not session.lease_refreshing
+					and session.next_lease_refresh_at <= os.clock()
+				then
+					table.insert(due, session)
+				end
+			end
+			table.sort(due, function(left, right)
+				return left.record.lease.expires_at < right.record.lease.expires_at
+			end)
+
+			for index = 1, math.min(capacity, #due) do
+				local session = due[index]
+				session.lease_refreshing = true
+				task.spawn(function()
+					local ok, refresh_error = self.inventory_repository:refresh(session)
+					if ok then
+						session.lease_failures = 0
+						session.next_lease_refresh_at = os.clock() + config.lease_refresh_seconds
+					else
+						session.lease_failures += 1
+						session.next_lease_refresh_at = os.clock() + config.lease_retry_seconds
+						self.observability:emit_alert("lease_refresh_failed", "warning", {
+							user_id = session.user_id,
+							error = tostring(refresh_error),
+						}, "lease:" .. tostring(session.user_id))
+						if refresh_error == "lease_lost" or session.lease_failures >= 3 then
+							session.ready = false
+							if session.player.Parent == players then
+								session.player:Kick("inventory connection lost; please rejoin")
+							end
+						end
+					end
+					session.lease_refreshing = false
+				end)
+			end
+		end
+	end)
+end
+
+function service:_start_sweep_loop()
+	task.spawn(function()
+		while self.running do
+			task.wait(config.transaction_sweep_seconds)
+			if self.running then
+				local ok, sweep_error = self.coordinator:sweep()
+				if not ok then
+					self.observability:emit_alert("transaction_sweep_failed", "warning", {
+						error = tostring(sweep_error),
+					}, "transaction_sweep")
+				end
+			end
+		end
+	end)
+end
+
+function service:start()
+	if self.running then
+		return
+	end
+	self.running = true
+	table.insert(self.connections, players.PlayerAdded:Connect(function(player)
+		task.spawn(self._load_player, self, player)
+	end))
+	table.insert(self.connections, players.PlayerRemoving:Connect(function(player)
+		self:_remove_player(player)
+	end))
+	for _, player in ipairs(players:GetPlayers()) do
+		task.spawn(self._load_player, self, player)
+	end
+
+	local subscribed, subscription = pcall(messaging_service.SubscribeAsync, messaging_service, config.recovery_topic, function(message)
+		local data = message.Data
+		if type(data) == "table" and utility.is_trade_id(data.transaction_id) then
+			self.coordinator:start_recovery(data.transaction_id)
+		end
+	end)
+	if subscribed then
+		table.insert(self.connections, subscription)
+	end
+	self:_start_lease_loop()
+	self:_start_sweep_loop()
+end
+
+function service:stop()
+	if self.stopping then
+		return
+	end
+	self.stopping = true
+	self.running = false
+	for _, connection in ipairs(self.connections) do
+		connection:Disconnect()
+	end
+	table.clear(self.connections)
+
+	local remaining = 0
+	for _, session in pairs(self.sessions) do
+		remaining += 1
+		task.spawn(function()
+			session.active = false
+			session.ready = false
+			local pending = session.record and session.record.pending_transaction
+			self.inventory_repository:release(session)
+			if pending ~= nil then
+				self.coordinator:recover_once(pending)
+			end
+			remaining -= 1
+		end)
+	end
+	local deadline = os.clock() + 25
+	while remaining > 0 and os.clock() < deadline do
+		task.wait(0.05)
+	end
+	self.stopping = false
+end
+
+function service:get_inventory(value: any)
+	local user_id = typeof(value) == "Instance" and value:IsA("Player") and value.UserId or value
+	local session = type(user_id) == "number" and self.sessions[user_id] or nil
+	if session == nil or not session.ready or session.record == nil then
+		return false, "not_ready"
+	end
+	return true, utility.deep_copy(session.record)
+end
+
+function service:grant_item(value: any, raw_item: any)
+	local user_id = typeof(value) == "Instance" and value:IsA("Player") and value.UserId or value
+	local session = type(user_id) == "number" and self.sessions[user_id] or nil
+	if session == nil then
+		return false, "not_ready"
+	end
+	if self.user_trade[session.user_id] ~= nil then
+		return false, "trade_active"
+	end
+	local item, item_error = schema.normalize_item(raw_item, true)
+	if item == nil then
+		return false, item_error
+	end
+	local ok, result = self.inventory_repository:mutate(session, function(record)
+		if record.items[item.id] ~= nil then
+			return false, "duplicate_item_id"
+		end
+		local count = 0
+		for _ in pairs(record.items) do
+			count += 1
+		end
+		if count >= config.maximum_inventory_items then
+			return false, "inventory_full"
+		end
+		record.items[item.id] = item
+		return true, item.id
+	end)
+	if ok then
+		self:_push_inventory(session, "item_granted")
+	end
+	return ok, result
+end
+
+function service:revoke_item(value: any, item_id: any)
+	local user_id = typeof(value) == "Instance" and value:IsA("Player") and value.UserId or value
+	local session = type(user_id) == "number" and self.sessions[user_id] or nil
+	if session == nil or not utility.is_safe_identifier(item_id, 8, config.maximum_item_id_bytes) then
+		return false, session == nil and "not_ready" or "invalid_item_id"
+	end
+	if self.user_trade[session.user_id] ~= nil then
+		return false, "trade_active"
+	end
+	local ok, result = self.inventory_repository:mutate(session, function(record)
+		if record.items[item_id] == nil then
+			return false, "item_not_found"
+		end
+		record.items[item_id] = nil
+		return true, item_id
+	end)
+	if ok then
+		self:_push_inventory(session, "item_revoked")
+	end
+	return ok, result
+end
+
+function service:set_trading_enabled(value: any, enabled: any)
+	local user_id = typeof(value) == "Instance" and value:IsA("Player") and value.UserId or value
+	local session = type(user_id) == "number" and self.sessions[user_id] or nil
+	if session == nil or type(enabled) ~= "boolean" then
+		return false, session == nil and "not_ready" or "invalid_enabled"
+	end
+	local trade_id = self.user_trade[session.user_id]
+	local trade = trade_id and self.trades[trade_id]
+	if trade ~= nil then
+		if trade.status == "committing" then
+			return false, "commit_in_progress"
+		end
+		self:_close_trade(trade, "trading_disabled")
+	end
+	local ok, result = self.inventory_repository:mutate(session, function(record)
+		record.settings.trading_enabled = enabled
+		return true, enabled
+	end)
+	if ok then
+		self:_push_inventory(session, "settings_changed")
+	end
+	return ok, result
+end
+
+function service:cancel_trade(value: any, reason: any)
+	local user_id = typeof(value) == "Instance" and value:IsA("Player") and value.UserId or value
+	local session = type(user_id) == "number" and self.sessions[user_id] or nil
+	local trade_id = session and self.user_trade[session.user_id]
+	local trade = trade_id and self.trades[trade_id]
+	if trade == nil then
+		return false, "trade_not_found"
+	end
+	if trade.status == "committing" then
+		return false, "commit_in_progress"
+	end
+	local close_reason = type(reason) == "string" and #reason <= 64 and reason or "server_cancelled"
+	self:_close_trade(trade, close_reason)
+	return true
+end
+
+return service

@@ -1,0 +1,189 @@
+--!strict
+
+local data_store_service = game:GetService("DataStoreService")
+
+local config = require(script.Parent.Parent.shared:WaitForChild("trading_config (module)"))
+local schema = require(script.Parent.Parent.shared:WaitForChild("trading_schema (module)"))
+local utility = require(script.Parent.Parent.shared:WaitForChild("trading_utility (module)"))
+
+local repository = {}
+repository.__index = repository
+
+local open_index_key = "open_transactions"
+local maximum_open_transactions = 500
+
+local function transaction_key(transaction_id: string): string
+	return "tx_" .. transaction_id
+end
+
+function repository.new(gateway: any, observability: any)
+	local self = setmetatable({}, repository)
+	self.gateway = gateway
+	self.observability = observability
+	self.store = data_store_service:GetDataStore(config.transaction_store_name)
+	self.open_store = data_store_service:GetDataStore(config.open_transaction_store_name)
+	return self
+end
+
+function repository:_set_indexed(transaction_id: string, indexed: boolean)
+	local ok, result = self.gateway:update(self.open_store, open_index_key, function(current)
+		local index = type(current) == "table" and current or {}
+		if indexed then
+			index[transaction_id] = os.time()
+		else
+			index[transaction_id] = nil
+		end
+
+		local entries = {}
+		for id, timestamp in pairs(index) do
+			table.insert(entries, { id = id, timestamp = timestamp })
+		end
+		if #entries > maximum_open_transactions then
+			table.sort(entries, function(left, right)
+				return left.timestamp < right.timestamp
+			end)
+			for position = 1, #entries - maximum_open_transactions do
+				index[entries[position].id] = nil
+			end
+		end
+		return index
+	end)
+	return ok, result
+end
+
+function repository:create(transaction: any)
+	local already_exists = false
+	local ok, saved_or_error = self.gateway:update(self.store, transaction_key(transaction.id), function(current)
+		if current ~= nil then
+			already_exists = true
+			return current
+		end
+		return utility.deep_copy(transaction)
+	end)
+	if not ok then
+		return false, saved_or_error
+	end
+	if already_exists then
+		local existing, existing_error = schema.normalize_transaction(saved_or_error, transaction.id)
+		if existing ~= nil and utility.deep_equal(existing, transaction) then
+			return true, existing
+		end
+		return false, existing_error or "transaction_exists"
+	end
+
+	local normalized, reason = schema.normalize_transaction(saved_or_error, transaction.id)
+	if normalized == nil then
+		return false, reason
+	end
+	self:_set_indexed(transaction.id, true)
+	self.observability:append_audit(transaction.id, "created", { state = normalized.state })
+	return true, normalized
+end
+
+function repository:get(transaction_id: string)
+	local ok, raw_or_error = self.gateway:get(self.store, transaction_key(transaction_id))
+	if not ok then
+		return nil, raw_or_error
+	end
+	if raw_or_error == nil then
+		return nil, "not_found"
+	end
+	return schema.normalize_transaction(raw_or_error, transaction_id)
+end
+
+function repository:transition(transaction_id: string, allowed_from: { [string]: boolean }, next_state: string)
+	local denied_reason = nil
+	local ok, saved_or_error = self.gateway:update(self.store, transaction_key(transaction_id), function(current)
+		local transaction, reason = schema.normalize_transaction(current, transaction_id)
+		if transaction == nil then
+			denied_reason = reason
+			return nil
+		end
+		if transaction.state == next_state then
+			return transaction
+		end
+		if not allowed_from[transaction.state] then
+			denied_reason = "invalid_transition"
+			return nil
+		end
+		transaction.state = next_state
+		transaction.updated_at = os.time()
+		if next_state == "completed" or next_state == "aborted" then
+			transaction.terminal_at = os.time()
+		end
+		return transaction
+	end)
+	if not ok then
+		return nil, saved_or_error
+	end
+	if saved_or_error == nil then
+		return nil, denied_reason or "transition_rejected"
+	end
+
+	local transaction, reason = schema.normalize_transaction(saved_or_error, transaction_id)
+	if transaction == nil then
+		return nil, reason
+	end
+	if transaction.state == "completed" or transaction.state == "aborted" then
+		self:_set_indexed(transaction_id, false)
+	end
+	self.observability:append_audit(transaction_id, "transitioned", { state = transaction.state })
+	return transaction
+end
+
+function repository:mark_progress(transaction_id: string, section: string, user_id: number, value: boolean)
+	local ok, saved_or_error = self.gateway:update(self.store, transaction_key(transaction_id), function(current)
+		local transaction = schema.normalize_transaction(current, transaction_id)
+		if transaction == nil then
+			return nil
+		end
+		local progress_section = transaction.progress[section]
+		if type(progress_section) ~= "table" then
+			return nil
+		end
+		progress_section[tostring(user_id)] = value
+		transaction.updated_at = os.time()
+		return transaction
+	end)
+	if not ok or saved_or_error == nil then
+		return false, ok and "progress_rejected" or saved_or_error
+	end
+	return true
+end
+
+function repository:note_recovery(transaction_id: string, last_error: string?)
+	local ok, saved_or_error = self.gateway:update(self.store, transaction_key(transaction_id), function(current)
+		local transaction = schema.normalize_transaction(current, transaction_id)
+		if transaction == nil then
+			return nil
+		end
+		transaction.progress.recovery_count += 1
+		transaction.progress.last_error = last_error or ""
+		transaction.updated_at = os.time()
+		return transaction
+	end)
+	return ok and saved_or_error ~= nil
+end
+
+function repository:list_open()
+	local ok, index_or_error = self.gateway:get(self.open_store, open_index_key)
+	if not ok then
+		return nil, index_or_error
+	end
+	if type(index_or_error) ~= "table" then
+		return {}
+	end
+
+	local result = {}
+	for transaction_id, timestamp in pairs(index_or_error) do
+		if utility.is_trade_id(transaction_id) and utility.is_safe_integer(timestamp) then
+			table.insert(result, { id = transaction_id, timestamp = timestamp })
+		end
+	end
+	table.sort(result, function(left, right)
+		return left.timestamp < right.timestamp
+	end)
+	return result
+end
+
+return repository

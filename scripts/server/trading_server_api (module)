@@ -1,0 +1,111 @@
+--!strict
+
+local config = require(script.Parent.Parent.shared:WaitForChild("trading_config (module)"))
+local utility = require(script.Parent.Parent.shared:WaitForChild("trading_utility (module)"))
+
+local server_api = {}
+server_api.__index = server_api
+
+function server_api.new(
+	trading_service: any,
+	transaction_repository: any,
+	coordinator: any,
+	observability: any,
+	verification: any,
+	invoke: BindableFunction
+)
+	local self = setmetatable({}, server_api)
+	self.trading_service = trading_service
+	self.transaction_repository = transaction_repository
+	self.coordinator = coordinator
+	self.observability = observability
+	self.verification = verification
+	self.invoke = invoke
+	return self
+end
+
+function server_api:_inspect_inventory(value: any)
+	local user_id = typeof(value) == "Instance" and value:IsA("Player") and value.UserId or value
+	local session = type(user_id) == "number" and self.trading_service:get_session(user_id) or nil
+	if session == nil or session.record == nil then
+		return false, "not_loaded"
+	end
+	return true, {
+		user_id = session.user_id,
+		ready = session.ready,
+		active = session.active,
+		revision = session.record.revision,
+		pending_transaction = session.record.pending_transaction,
+		lease_owner = session.record.lease.owner,
+		lease_expires_at = session.record.lease.expires_at,
+	}
+end
+
+function server_api:_handle(action: any, ...: any)
+	if type(action) ~= "string" then
+		return false, "invalid_action"
+	end
+	local arguments = table.pack(...)
+	if action == "get_inventory" then
+		return self.trading_service:get_inventory(arguments[1])
+	elseif action == "grant_item" then
+		return self.trading_service:grant_item(arguments[1], arguments[2])
+	elseif action == "revoke_item" then
+		return self.trading_service:revoke_item(arguments[1], arguments[2])
+	elseif action == "set_trading_enabled" then
+		return self.trading_service:set_trading_enabled(arguments[1], arguments[2])
+	elseif action == "cancel_trade" then
+		return self.trading_service:cancel_trade(arguments[1], arguments[2])
+	elseif action == "inspect_transaction" then
+		if not utility.is_trade_id(arguments[1]) then
+			return false, "invalid_transaction_id"
+		end
+		local transaction, read_error = self.transaction_repository:get(arguments[1])
+		return transaction ~= nil, transaction or read_error
+	elseif action == "inspect_inventory" then
+		return self:_inspect_inventory(arguments[1])
+	elseif action == "get_durable_alerts" then
+		return self.observability:get_durable_alerts()
+	elseif action == "get_metrics" then
+		return true, self.observability:snapshot()
+	elseif action == "sweep_transactions" then
+		return self.coordinator:sweep()
+	elseif action == "reconcile_inventory" then
+		local ok, inventory_or_error = self.trading_service:get_inventory(arguments[1])
+		if not ok or inventory_or_error.pending_transaction == nil then
+			return false, ok and "no_reconciliation" or inventory_or_error
+		end
+		self.coordinator:start_recovery(inventory_or_error.pending_transaction)
+		return true, "recovery_started"
+	elseif action == "resolve_quarantine" then
+		return false, "not_quarantined"
+	elseif action == "run_self_tests" then
+		return self.verification.run_all()
+	elseif action == "get_self_test_report" then
+		return true, utility.deep_copy(self.verification.last_report)
+	elseif action == "run_lease_load_test" then
+		return self.verification.run_lease_load_test(arguments[1], arguments[2], arguments[3])
+	elseif action == "run_live_budget_soak" then
+		return false, "live_soak_not_enabled"
+	elseif action == "migration_status" then
+		return true, {
+			inventory_current = config.inventory_schema_version,
+			inventory_supported_from = 1,
+			transaction_current = config.transaction_schema_version,
+			transaction_supported_from = 1,
+		}
+	end
+	return false, "unknown_action"
+end
+
+function server_api:start()
+	self.invoke.OnInvoke = function(action, ...)
+		return self:_handle(action, ...)
+	end
+end
+
+function server_api:stop()
+	self.invoke.OnInvoke = nil
+end
+
+return server_api

@@ -1,0 +1,167 @@
+--!strict
+
+local messaging_service = game:GetService("MessagingService")
+
+local config = require(script.Parent.Parent.shared:WaitForChild("trading_config (module)"))
+local protocol = require(script.Parent:WaitForChild("trade_protocol (module)"))
+local utility = require(script.Parent.Parent.shared:WaitForChild("trading_utility (module)"))
+
+local coordinator = {}
+coordinator.__index = coordinator
+
+function coordinator.new(inventory_repository: any, transaction_repository: any, observability: any, server_id: string)
+	local self = setmetatable({}, coordinator)
+	self.inventory_repository = inventory_repository
+	self.transaction_repository = transaction_repository
+	self.observability = observability
+	self.server_id = server_id
+	self.sessions = {}
+	self.recovery_workers = {}
+	return self
+end
+
+function coordinator:set_session_lookup(sessions: { [number]: any })
+	self.sessions = sessions
+end
+
+function coordinator:build_transaction(trade: any)
+	local outgoing = {}
+	for _, user_id in ipairs(trade.users) do
+		local session = self.sessions[user_id]
+		if session == nil or session.record == nil then
+			return nil, "participant_unavailable"
+		end
+		local items = {}
+		for _, item_id in ipairs(trade.offers[tostring(user_id)].ids) do
+			local item = session.record.items[item_id]
+			if item == nil or not item.tradable then
+				return nil, "offer_changed"
+			end
+			table.insert(items, utility.deep_copy(item))
+		end
+		outgoing[tostring(user_id)] = items
+	end
+
+	local now = os.time()
+	return {
+		schema_version = config.transaction_schema_version,
+		protocol_revision = config.protocol_revision,
+		id = trade.id,
+		state = "prepared",
+		users = { trade.users[1], trade.users[2] },
+		outgoing = outgoing,
+		created_at = now,
+		updated_at = now,
+		server_id = self.server_id,
+		progress = {
+			prepared = {},
+			applied = {},
+			recovery_count = 0,
+			last_error = "",
+		},
+		terminal_at = nil,
+	}
+end
+
+function coordinator:_ops()
+	return {
+		create = function(transaction)
+			return self.transaction_repository:create(transaction)
+		end,
+		prepare = function(user_id, transaction)
+			local session = self.sessions[user_id]
+			if session == nil then
+				return false, "participant_unavailable"
+			end
+			return self.inventory_repository:prepare(session, transaction)
+		end,
+		rollback = function(user_id, transaction_id)
+			local session = self.sessions[user_id]
+			return self.inventory_repository:rollback_user(user_id, transaction_id, session and session.active and session or nil)
+		end,
+		apply = function(user_id, transaction)
+			local session = self.sessions[user_id]
+			return self.inventory_repository:apply_transaction(transaction, user_id, session and session.active and session or nil)
+		end,
+		transition = function(transaction_id, allowed_from, next_state)
+			return self.transaction_repository:transition(transaction_id, allowed_from, next_state)
+		end,
+		mark_progress = function(transaction_id, section, user_id, value)
+			return self.transaction_repository:mark_progress(transaction_id, section, user_id, value)
+		end,
+	}
+end
+
+function coordinator:commit(trade: any)
+	local transaction, build_error = self:build_transaction(trade)
+	if transaction == nil then
+		return false, build_error
+	end
+
+	self.observability.metrics.commits_started += 1
+	local ok, result = protocol.execute(transaction, self:_ops())
+	if ok then
+		self.observability.metrics.commits_completed += 1
+		pcall(messaging_service.PublishAsync, messaging_service, config.recovery_topic, {
+			transaction_id = transaction.id,
+			state = "completed",
+		})
+		return true, result
+	end
+
+	self.observability.metrics.commits_failed += 1
+	self.observability:emit_alert("trade_commit_incomplete", "critical", {
+		transaction_id = transaction.id,
+		error = tostring(result),
+	}, "commit:" .. transaction.id)
+	self:start_recovery(transaction.id)
+	return false, result
+end
+
+function coordinator:recover_once(transaction_id: string)
+	local transaction, read_error = self.transaction_repository:get(transaction_id)
+	if transaction == nil then
+		return false, read_error
+	end
+	self.transaction_repository:note_recovery(transaction_id)
+	local ok, result = protocol.recover(transaction, self:_ops())
+	if ok then
+		self.observability.metrics.commits_recovered += 1
+	end
+	return ok, result
+end
+
+function coordinator:start_recovery(transaction_id: string)
+	if self.recovery_workers[transaction_id] then
+		return
+	end
+	self.recovery_workers[transaction_id] = true
+	task.spawn(function()
+		for attempt = 1, config.write_attempts do
+			local ok, result = self:recover_once(transaction_id)
+			if ok then
+				break
+			end
+			self.transaction_repository:note_recovery(transaction_id, tostring(result))
+			task.wait(math.min(8, attempt * 1.5))
+		end
+		self.recovery_workers[transaction_id] = nil
+	end)
+end
+
+function coordinator:sweep()
+	local entries, list_error = self.transaction_repository:list_open()
+	if entries == nil then
+		return false, list_error
+	end
+	local started = 0
+	for _, entry in ipairs(entries) do
+		if os.time() - entry.timestamp >= config.transaction_recovery_age_seconds then
+			self:start_recovery(entry.id)
+			started += 1
+		end
+	end
+	return true, started
+end
+
+return coordinator

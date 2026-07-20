@@ -1,0 +1,88 @@
+--!strict
+
+local replicated_storage = game:GetService("ReplicatedStorage")
+local run_service = game:GetService("RunService")
+local server_storage = game:GetService("ServerStorage")
+
+assert(run_service:IsServer(), "the trading system must run on the server")
+
+local shared = script.Parent:WaitForChild("shared")
+local server = script.Parent:WaitForChild("server")
+
+local config = require(shared:WaitForChild("trading_config (module)"))
+local utility = require(shared:WaitForChild("trading_utility (module)"))
+local gateway_module = require(server:WaitForChild("data_store_gateway (module)"))
+local observability_module = require(server:WaitForChild("trading_observability (module)"))
+local inventory_repository_module = require(server:WaitForChild("inventory_repository (module)"))
+local transaction_repository_module = require(server:WaitForChild("transaction_repository (module)"))
+local coordinator_module = require(server:WaitForChild("transaction_coordinator (module)"))
+local service_module = require(server:WaitForChild("trading_service (module)"))
+local router_module = require(server:WaitForChild("trading_remote_router (module)"))
+local server_api_module = require(server:WaitForChild("trading_server_api (module)"))
+local verification = require(server:WaitForChild("trading_verification (module)"))
+
+local function ensure_instance(parent: Instance, class_name: string, name: string): Instance
+	local existing = parent:FindFirstChild(name)
+	if existing ~= nil then
+		assert(existing.ClassName == class_name, string.format("%s must be a %s", existing:GetFullName(), class_name))
+		return existing
+	end
+	local created = Instance.new(class_name)
+	created.Name = name
+	created.Parent = parent
+	return created
+end
+
+local remote_folder = ensure_instance(replicated_storage, "Folder", config.remote_folder_name)
+local request_remote = ensure_instance(remote_folder, "RemoteEvent", config.request_remote_name) :: RemoteEvent
+local push_remote = ensure_instance(remote_folder, "RemoteEvent", config.push_remote_name) :: RemoteEvent
+
+local api_folder = ensure_instance(server_storage, "Folder", config.server_api_folder_name)
+local api_invoke = ensure_instance(api_folder, "BindableFunction", "invoke") :: BindableFunction
+local api_changed = ensure_instance(api_folder, "BindableEvent", "changed") :: BindableEvent
+
+local server_id = game.JobId
+if server_id == "" then
+	server_id = utility.new_id("studio_")
+end
+
+script:SetAttribute("architecture_revision", 3)
+script:SetAttribute("inventory_schema_version", config.inventory_schema_version)
+script:SetAttribute("transaction_schema_version", config.transaction_schema_version)
+
+local gateway = gateway_module.new()
+local observability = observability_module.new(gateway, api_changed)
+local inventory_repository = inventory_repository_module.new(gateway, server_id, observability)
+local transaction_repository = transaction_repository_module.new(gateway, observability)
+local coordinator = coordinator_module.new(inventory_repository, transaction_repository, observability, server_id)
+local trading_service = service_module.new(inventory_repository, transaction_repository, coordinator, observability)
+local remote_router = router_module.new(trading_service, observability, request_remote, push_remote)
+local server_api = server_api_module.new(
+	trading_service,
+	transaction_repository,
+	coordinator,
+	observability,
+	verification,
+	api_invoke
+)
+
+if script:GetAttribute("disable_self_tests") ~= true then
+	local passed, report = verification.run_all()
+	script:SetAttribute("self_test_passed", passed)
+	script:SetAttribute("self_test_count", report.passed_count)
+	script:SetAttribute("self_test_finished_at", report.finished_at)
+	if not passed then
+		error("trading self-tests failed; the service was not started")
+	end
+end
+
+trading_service:set_push_remote(push_remote)
+server_api:start()
+remote_router:start()
+trading_service:start()
+
+game:BindToClose(function()
+	remote_router:stop()
+	server_api:stop()
+	trading_service:stop()
+end)
