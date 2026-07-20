@@ -4,33 +4,6 @@ TradingSystem is a server-authoritative Roblox trading package for item transfer
 
 This repository is the authoritative server package and protocol documentation. It does not include a client ui/controller, and it does not claim that any distributed system is 100% failure-proof. Read [TESTING.md](TESTING.md) and validate the package in a separate published test place before release.
 
-## Script layout
-
-Copy the complete `scripts` tree into `ServerScriptService/trading_system` with the same folders and names:
-
-```text
-trading_system
-|-- trading_server (server)
-|-- shared
-|   |-- trading_config (module)
-|   |-- trading_schema (module)
-|   |-- trading_types (module)
-|   `-- trading_utility (module)
-`-- server
-    |-- data_store_gateway (module)
-    |-- inventory_repository (module)
-    |-- trade_protocol (module)
-    |-- trade_transfer_rules (module)
-    |-- trading_observability (module)
-    |-- trading_remote_router (module)
-    |-- trading_server_api (module)
-    |-- trading_service (module)
-    |-- trading_verification (module)
-    |-- transaction_coordinator (module)
-    `-- transaction_repository (module)
-```
-
-The repository files intentionally have no `.server`, `.lua`, or `.luau` suffix. The Roblox script type appears in parentheses in each filename.
 
 ## Installation
 
