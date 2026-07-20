@@ -1,0 +1,51 @@
+--!strict
+
+local config = require(script.Parent.Parent.shared:WaitForChild("trading_config (module)"))
+local utility = require(script.Parent.Parent.shared:WaitForChild("trading_utility (module)"))
+
+local rules = {}
+
+function rules.sides(transaction: any, user_id: number): ({ any }?, { any }?, string?)
+	local left_user_id = transaction.users[1]
+	local right_user_id = transaction.users[2]
+	if user_id == left_user_id then
+		return transaction.outgoing[tostring(left_user_id)], transaction.outgoing[tostring(right_user_id)], nil
+	end
+	if user_id == right_user_id then
+		return transaction.outgoing[tostring(right_user_id)], transaction.outgoing[tostring(left_user_id)], nil
+	end
+	return nil, nil, "not_participant"
+end
+
+function rules.validate(record: any, transaction: any, user_id: number): (boolean, string?, { any }?, { any }?, number?)
+	local outgoing, incoming, side_error = rules.sides(transaction, user_id)
+	if outgoing == nil or incoming == nil then
+		return false, side_error or "invalid_transaction_side", nil, nil, nil
+	end
+
+	local current_count = 0
+	for _ in pairs(record.items) do
+		current_count += 1
+	end
+
+	for _, item in ipairs(outgoing) do
+		local owned = record.items[item.id]
+		if owned == nil or not owned.tradable or not utility.deep_equal(owned, item) then
+			return false, "outgoing_item_changed", nil, nil, nil
+		end
+	end
+
+	for _, item in ipairs(incoming) do
+		if record.items[item.id] ~= nil then
+			return false, "incoming_item_collision", nil, nil, nil
+		end
+	end
+
+	local projected_count = current_count - #outgoing + #incoming
+	if projected_count < 0 or projected_count > config.maximum_inventory_items then
+		return false, "inventory_capacity_exceeded", nil, nil, nil
+	end
+	return true, nil, outgoing, incoming, projected_count
+end
+
+return table.freeze(rules)

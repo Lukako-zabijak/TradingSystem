@@ -5,6 +5,7 @@ local data_store_service = game:GetService("DataStoreService")
 local config = require(script.Parent.Parent.shared:WaitForChild("trading_config (module)"))
 local schema = require(script.Parent.Parent.shared:WaitForChild("trading_schema (module)"))
 local utility = require(script.Parent.Parent.shared:WaitForChild("trading_utility (module)"))
+local transfer_rules = require(script.Parent:WaitForChild("trade_transfer_rules (module)"))
 
 local repository = {}
 repository.__index = repository
@@ -13,29 +14,54 @@ local function inventory_key(user_id: number): string
 	return "user_" .. tostring(user_id)
 end
 
+local function mutation_key(mutation_id: string): string
+	return "op_" .. mutation_id
+end
+
+local function lease_identity_matches(record: any, server_id: string, session: any): boolean
+	return record.lease.owner == server_id and record.lease.token == session.lease_token
+end
+
+local function owns_lease(record: any, server_id: string, session: any): boolean
+	return lease_identity_matches(record, server_id, session) and record.lease.expires_at > os.time()
+end
+
 function repository.new(gateway: any, server_id: string, observability: any)
 	local self = setmetatable({}, repository)
 	self.gateway = gateway
 	self.server_id = server_id
 	self.observability = observability
 	self.store = data_store_service:GetDataStore(config.inventory_store_name)
+	self.mutation_store = data_store_service:GetDataStore(config.mutation_store_name)
 	return self
 end
 
-function repository:lock(session: any)
+function repository:lock(session: any): boolean
 	while session.locked do
+		if session.destroyed then
+			return false
+		end
 		session.unlocked.Event:Wait()
 	end
+	if session.destroyed then
+		return false
+	end
 	session.locked = true
+	return true
 end
 
 function repository:unlock(session: any)
 	session.locked = false
-	session.unlocked:Fire()
+	pcall(session.unlocked.Fire, session.unlocked)
+	if session.destroyed then
+		pcall(session.unlocked.Destroy, session.unlocked)
+	end
 end
 
 function repository:with_lock(session: any, callback: () -> ...any)
-	self:lock(session)
+	if not self:lock(session) then
+		return false, "session_closed"
+	end
 	local packed = table.pack(xpcall(callback, debug.traceback))
 	self:unlock(session)
 	if not packed[1] then
@@ -44,150 +70,460 @@ function repository:with_lock(session: any, callback: () -> ...any)
 	return table.unpack(packed, 2, packed.n)
 end
 
-function repository:acquire(session: any)
-	local now = os.time()
-	local normalized_error = nil
-	local ok, saved_or_error = self.gateway:update(self.store, inventory_key(session.user_id), function(current)
-		local record, reason = schema.normalize_inventory(current, session.user_id)
-		if record == nil then
-			normalized_error = reason
-			error(reason)
-		end
-		if record.lease.owner ~= "" and record.lease.expires_at > now then
-			return nil
-		end
-		record.lease = {
-			owner = self.server_id,
-			token = session.lease_token,
-			expires_at = now + config.lease_seconds,
-		}
-		record.updated_at = now
-		return record
-	end, config.load_attempts)
+function repository:destroy_session(session: any)
+	session.destroyed = true
+	if not session.locked then
+		pcall(session.unlocked.Fire, session.unlocked)
+		pcall(session.unlocked.Destroy, session.unlocked)
+	end
+end
+
+function repository:_read_consistent(user_id: number)
+	local ok, raw_or_error = self.gateway:get_consistent(self.store, inventory_key(user_id))
 	if not ok then
-		return false, normalized_error or saved_or_error
+		return nil, raw_or_error
+	end
+	return schema.normalize_inventory(raw_or_error, user_id)
+end
+
+function repository:_read_mutation_consistent(mutation_id: string)
+	local ok, raw_or_error = self.gateway:get_consistent(self.mutation_store, mutation_key(mutation_id))
+	if not ok then
+		return nil, raw_or_error
+	end
+	if raw_or_error == nil then
+		return nil, "mutation_not_found"
+	end
+	return schema.normalize_mutation_operation(raw_or_error, mutation_id)
+end
+
+function repository:_begin_mutation(operation: any)
+	if type(operation) ~= "table" or not utility.is_mutation_id(operation.id) then
+		return nil, "invalid_mutation_operation"
+	end
+	local candidate, candidate_error = schema.normalize_mutation_operation(operation, operation.id)
+	if candidate == nil then
+		return nil, candidate_error
+	end
+	local denied_reason = nil
+	local ok, saved_or_error = self.gateway:update(
+		self.mutation_store,
+		mutation_key(candidate.id),
+		function(current)
+			if current == nil then
+				return utility.deep_copy(candidate)
+			end
+			local existing, existing_error = schema.normalize_mutation_operation(current, candidate.id)
+			if existing == nil then
+				denied_reason = existing_error
+				return nil
+			end
+			if not schema.mutation_operations_match(existing, candidate) then
+				denied_reason = "mutation_id_conflict"
+				return nil
+			end
+			return existing
+		end
+	)
+	if not ok then
+		local existing, read_error = self:_read_mutation_consistent(candidate.id)
+		if existing ~= nil then
+			if schema.mutation_operations_match(existing, candidate) then
+				return existing
+			end
+			return nil, "mutation_id_conflict"
+		end
+		return nil, read_error or saved_or_error
 	end
 	if saved_or_error == nil then
-		return false, "lease_busy"
+		return nil, denied_reason or "mutation_begin_rejected"
 	end
+	return schema.normalize_mutation_operation(saved_or_error, candidate.id)
+end
 
-	local record, reason = schema.normalize_inventory(saved_or_error, session.user_id)
-	if record == nil then
-		return false, reason
+function repository:_complete_mutation(mutation_id: string)
+	local denied_reason = nil
+	local ok, saved_or_error = self.gateway:update(self.mutation_store, mutation_key(mutation_id), function(current)
+		local operation, operation_error = schema.normalize_mutation_operation(current, mutation_id)
+		if operation == nil then
+			denied_reason = operation_error
+			return nil
+		end
+		if operation.status == "completed" then
+			return operation
+		end
+		operation.status = "completed"
+		operation.updated_at = math.max(os.time(), operation.updated_at)
+		return operation
+	end)
+	if not ok then
+		local operation, read_error = self:_read_mutation_consistent(mutation_id)
+		if operation ~= nil and operation.status == "completed" then
+			return operation
+		end
+		return nil, read_error or saved_or_error
 	end
-	session.record = record
+	if saved_or_error == nil then
+		return nil, denied_reason or "mutation_completion_rejected"
+	end
+	return schema.normalize_mutation_operation(saved_or_error, mutation_id)
+end
+
+function repository:_finalize_mutation(session: any, mutation_id: string)
+	local denied_reason = nil
+	local ok, saved_or_error = self.gateway:update(self.store, inventory_key(session.user_id), function(current)
+		local record = schema.normalize_inventory(current, session.user_id)
+		if record == nil then
+			denied_reason = "invalid_inventory"
+			return nil
+		end
+		if not owns_lease(record, self.server_id, session) then
+			denied_reason = "lease_lost"
+			return nil
+		end
+		if record.pending_mutation == nil then
+			return record
+		end
+		if record.pending_mutation ~= mutation_id or record.mutation_receipts[mutation_id] == nil then
+			denied_reason = "mutation_finalize_conflict"
+			return nil
+		end
+		record.pending_mutation = nil
+		record.updated_at = math.max(os.time(), record.updated_at)
+		return record
+	end)
+	if not ok then
+		local current = self:_read_consistent(session.user_id)
+		if
+			current ~= nil
+			and owns_lease(current, self.server_id, session)
+			and current.pending_mutation == nil
+			and current.mutation_receipts[mutation_id] ~= nil
+		then
+			session.record = current
+			return true
+		end
+		return false, saved_or_error
+	end
+	if saved_or_error == nil then
+		return false, denied_reason or "mutation_finalize_rejected"
+	end
+	local saved, saved_error = schema.normalize_inventory(saved_or_error, session.user_id)
+	if saved == nil then
+		return false, saved_error
+	end
+	session.record = saved
 	return true
 end
 
-function repository:refresh(session: any)
-	if session.record == nil then
-		return false, "not_loaded"
-	end
-	local now = os.time()
-	local lease_lost = false
-	local ok, saved_or_error = self.gateway:update(self.store, inventory_key(session.user_id), function(current)
-		local record = schema.normalize_inventory(current, session.user_id)
-		if record == nil then
-			lease_lost = true
-			return nil
+function repository:recover_mutation(session: any)
+	return self:with_lock(session, function()
+		if session.record == nil then
+			return false, "not_loaded"
 		end
-		if record.lease.owner ~= self.server_id or record.lease.token ~= session.lease_token then
-			lease_lost = true
-			return nil
+		local mutation_id = session.record.pending_mutation
+		if mutation_id == nil then
+			return true
 		end
-		record.lease.expires_at = now + config.lease_seconds
-		record.updated_at = now
-		return record
+		if session.record.mutation_receipts[mutation_id] == nil then
+			return false, "missing_mutation_receipt"
+		end
+		local operation, read_error = self:_read_mutation_consistent(mutation_id)
+		if operation == nil then
+			return false, read_error
+		end
+		if operation.user_id ~= session.user_id then
+			return false, "mutation_user_mismatch"
+		end
+		if operation.status ~= "completed" then
+			operation, read_error = self:_complete_mutation(mutation_id)
+			if operation == nil then
+				return false, read_error
+			end
+		end
+		return self:_finalize_mutation(session, mutation_id)
 	end)
-	if not ok then
-		return false, saved_or_error
-	end
-	if lease_lost or saved_or_error == nil then
-		return false, "lease_lost"
-	end
-	session.record = schema.normalize_inventory(saved_or_error, session.user_id)
-	return session.record ~= nil, session.record ~= nil and nil or "invalid_saved_record"
+end
+
+function repository:acquire(session: any)
+	return self:with_lock(session, function()
+		local requested_expiry = 0
+		local normalized_error = nil
+		local busy = false
+		local ok, saved_or_error = self.gateway:update(self.store, inventory_key(session.user_id), function(current)
+			local now = os.time()
+			local record, reason = schema.normalize_inventory(current, session.user_id)
+			if record == nil then
+				normalized_error = reason
+				return nil
+			end
+			if record.lease.owner ~= "" and record.lease.expires_at > now then
+				if not owns_lease(record, self.server_id, session) then
+					busy = true
+					return nil
+				end
+			end
+			requested_expiry = now + config.lease_seconds
+			record.lease = {
+				owner = self.server_id,
+				token = session.lease_token,
+				expires_at = requested_expiry,
+			}
+			record.updated_at = math.max(now, record.updated_at)
+			return record
+		end, config.load_attempts)
+		if not ok then
+			local current = self:_read_consistent(session.user_id)
+			if
+				current ~= nil
+				and requested_expiry > 0
+				and owns_lease(current, self.server_id, session)
+				and current.lease.expires_at >= requested_expiry
+			then
+				session.record = current
+				return true
+			end
+			return false, normalized_error or saved_or_error
+		end
+		if saved_or_error == nil then
+			return false, busy and "lease_busy" or normalized_error or "lease_rejected"
+		end
+
+		local record, reason = schema.normalize_inventory(saved_or_error, session.user_id)
+		if
+			record == nil
+			or requested_expiry <= 0
+			or not owns_lease(record, self.server_id, session)
+			or record.lease.expires_at < requested_expiry
+		then
+			return false, reason or "lease_lost"
+		end
+		session.record = record
+		return true
+	end)
+end
+
+function repository:refresh(session: any)
+	return self:with_lock(session, function()
+		if not session.active or session.record == nil then
+			return false, "not_loaded"
+		end
+		local requested_expiry = 0
+		local denied_reason = nil
+		local ok, saved_or_error = self.gateway:update(self.store, inventory_key(session.user_id), function(current)
+			local now = os.time()
+			local record = schema.normalize_inventory(current, session.user_id)
+			if record == nil or not owns_lease(record, self.server_id, session) then
+				denied_reason = "lease_lost"
+				return nil
+			end
+			requested_expiry = now + config.lease_seconds
+			record.lease.expires_at = requested_expiry
+			record.updated_at = math.max(now, record.updated_at)
+			return record
+		end)
+		if not ok then
+			local current = self:_read_consistent(session.user_id)
+			if
+				current ~= nil
+				and requested_expiry > 0
+				and owns_lease(current, self.server_id, session)
+				and current.lease.expires_at >= requested_expiry
+			then
+				session.record = current
+				return true
+			end
+			return false, saved_or_error
+		end
+		if saved_or_error == nil then
+			return false, denied_reason or "lease_lost"
+		end
+		local record, reason = schema.normalize_inventory(saved_or_error, session.user_id)
+		if
+			record == nil
+			or requested_expiry <= 0
+			or not owns_lease(record, self.server_id, session)
+			or record.lease.expires_at < requested_expiry
+		then
+			return false, reason or "lease_lost"
+		end
+		session.record = record
+		return true
+	end)
 end
 
 function repository:release(session: any)
-	if session.record == nil then
-		return true
-	end
-	local ok, saved_or_error = self.gateway:update(self.store, inventory_key(session.user_id), function(current)
-		local record = schema.normalize_inventory(current, session.user_id)
-		if record == nil then
-			return nil
+	return self:with_lock(session, function()
+		if session.record == nil then
+			return true
 		end
-		if record.lease.owner ~= self.server_id or record.lease.token ~= session.lease_token then
+		local denied_reason = nil
+		local ok, saved_or_error = self.gateway:update(self.store, inventory_key(session.user_id), function(current)
+			local record = schema.normalize_inventory(current, session.user_id)
+			if record == nil then
+				denied_reason = "invalid_inventory"
+				return nil
+			end
+			if record.lease.owner == "" then
+				return record
+			end
+			if not lease_identity_matches(record, self.server_id, session) then
+				denied_reason = "lease_lost"
+				return nil
+			end
+			record.lease = { owner = "", token = "", expires_at = 0 }
+			record.updated_at = math.max(os.time(), record.updated_at)
 			return record
+		end)
+		if not ok then
+			local current = self:_read_consistent(session.user_id)
+			if current ~= nil and current.lease.owner == "" then
+				session.record = current
+				return true
+			end
+			return false, saved_or_error
 		end
-		record.lease = { owner = "", token = "", expires_at = 0 }
-		record.updated_at = os.time()
-		return record
+		if saved_or_error == nil then
+			return false, denied_reason or "release_rejected"
+		end
+		local record, reason = schema.normalize_inventory(saved_or_error, session.user_id)
+		if record == nil then
+			return false, reason
+		end
+		session.record = record
+		return true
 	end)
-	if ok and saved_or_error ~= nil then
-		session.record = schema.normalize_inventory(saved_or_error, session.user_id)
-	end
-	return ok, ok and nil or saved_or_error
 end
 
-function repository:mutate(session: any, mutator: (any) -> (boolean, any))
+function repository:mutate(
+	session: any,
+	mutator: (any, any) -> (boolean, any),
+	operation: any
+)
 	return self:with_lock(session, function()
 		if not session.active or not session.ready or session.record == nil then
 			return false, "not_ready"
 		end
+		if session.record.lease.expires_at <= os.time() then
+			return false, "lease_expired"
+		end
 		if session.record.pending_transaction ~= nil then
 			return false, "inventory_recovering"
 		end
+		if type(operation) ~= "table" or not utility.is_mutation_id(operation.id) then
+			return false, "invalid_mutation_operation"
+		end
+		if session.record.pending_mutation ~= nil and session.record.pending_mutation ~= operation.id then
+			return false, "inventory_recovering"
+		end
 
-		local expected_revision = session.record.revision
-		local mutation_id = utility.new_id("mut_")
-		local desired = utility.deep_copy(session.record)
-		local changed, result = mutator(desired)
-		if not changed then
-			return false, result
+		local begun, begin_error = self:_begin_mutation(operation)
+		if begun == nil then
+			return false, begin_error
 		end
-		desired.revision += 1
-		desired.updated_at = os.time()
-		desired.mutation_receipts[mutation_id] = os.time()
-		utility.prune_receipts(desired.mutation_receipts, mutation_id, config.maximum_mutation_receipts)
+		local mutation_id = begun.id
+		if session.record.pending_mutation ~= nil and session.record.pending_mutation ~= mutation_id then
+			return false, "inventory_recovering"
+		end
+		if begun.status == "completed" then
+			if session.record.pending_mutation == mutation_id then
+				local finalized, finalize_error = self:_finalize_mutation(session, mutation_id)
+				if not finalized then
+					return false, finalize_error
+				end
+			end
+			return true, begun.result
+		end
 
-		local conflict = false
-		local lease_lost = false
-		local function apply_mutation(current)
-			local record = schema.normalize_inventory(current, session.user_id)
-			if record == nil then
-				return nil
+		if session.record.mutation_receipts[mutation_id] == nil then
+			local expected_revision = session.record.revision
+			local desired = utility.deep_copy(session.record)
+			local changed, result = mutator(desired, begun)
+			if not changed then
+				return false, result
 			end
-			if record.lease.owner ~= self.server_id or record.lease.token ~= session.lease_token then
-				lease_lost = true
-				return nil
+			if not utility.deep_equal(result, begun.result) then
+				return false, "mutation_result_mismatch"
 			end
-			if record.mutation_receipts[mutation_id] ~= nil then
-				return record
+			desired.revision += 1
+			desired.updated_at = math.max(os.time(), desired.updated_at)
+			desired.pending_mutation = mutation_id
+			desired.mutation_receipts[mutation_id] = os.time()
+			utility.prune_receipts(desired.mutation_receipts, mutation_id, config.maximum_mutation_receipts)
+			local normalized_desired, desired_error = schema.normalize_inventory(desired, session.user_id)
+			if normalized_desired == nil then
+				return false, desired_error or "invalid_mutation"
 			end
-			if record.revision ~= expected_revision or record.pending_transaction ~= nil then
-				conflict = true
-				return nil
+			desired = normalized_desired
+
+			local denied_reason = nil
+			local function apply_mutation(current)
+				local record = schema.normalize_inventory(current, session.user_id)
+				if record == nil then
+					denied_reason = "invalid_inventory"
+					return nil
+				end
+				if not owns_lease(record, self.server_id, session) then
+					denied_reason = "lease_lost"
+					return nil
+				end
+				if record.mutation_receipts[mutation_id] ~= nil then
+					if record.pending_mutation == mutation_id then
+						return record
+					end
+					denied_reason = "legacy_mutation_receipt_conflict"
+					return nil
+				end
+				if
+					record.revision ~= expected_revision
+					or record.pending_transaction ~= nil
+					or record.pending_mutation ~= nil
+				then
+					denied_reason = "revision_conflict"
+					return nil
+				end
+				desired.lease = utility.deep_copy(record.lease)
+				return desired
 			end
-			desired.lease = utility.deep_copy(record.lease)
-			return desired
+			local ok, saved_or_error = self.gateway:update(self.store, inventory_key(session.user_id), apply_mutation)
+			if not ok then
+				local current = self:_read_consistent(session.user_id)
+				if
+					current ~= nil
+					and owns_lease(current, self.server_id, session)
+					and current.pending_mutation == mutation_id
+					and current.mutation_receipts[mutation_id] ~= nil
+				then
+					session.record = current
+				else
+					return false, saved_or_error
+				end
+			elseif saved_or_error == nil then
+				return false, denied_reason or "mutation_rejected"
+			else
+				local saved, reason = schema.normalize_inventory(saved_or_error, session.user_id)
+				if
+					saved == nil
+					or saved.pending_mutation ~= mutation_id
+					or saved.mutation_receipts[mutation_id] == nil
+				then
+					return false, reason or "invalid_saved_record"
+				end
+				session.record = saved
+			end
+		elseif session.record.pending_mutation ~= mutation_id then
+			return false, "legacy_mutation_receipt_conflict"
 		end
-		local ok, saved_or_error = self.gateway:update(self.store, inventory_key(session.user_id), apply_mutation)
-		if not ok then
-			ok, saved_or_error = self.gateway:update(self.store, inventory_key(session.user_id), apply_mutation)
+
+		local completed, complete_error = self:_complete_mutation(mutation_id)
+		if completed == nil then
+			return false, complete_error
 		end
-		if not ok then
-			return false, saved_or_error
+		local finalized, finalize_error = self:_finalize_mutation(session, mutation_id)
+		if not finalized then
+			return false, finalize_error
 		end
-		if lease_lost then
-			return false, "lease_lost"
-		end
-		if conflict or saved_or_error == nil then
-			return false, "revision_conflict"
-		end
-		session.record = schema.normalize_inventory(saved_or_error, session.user_id)
-		return true, result
+		return true, completed.result
 	end)
 end
 
@@ -196,126 +532,100 @@ function repository:prepare(session: any, transaction: any)
 		if not session.active or not session.ready or session.record == nil then
 			return false, "not_ready"
 		end
-		if session.record.pending_transaction ~= nil then
+		if session.record.lease.expires_at <= os.time() then
+			return false, "lease_expired"
+		end
+		if
+			session.record.pending_transaction ~= nil
+			and session.record.pending_transaction ~= transaction.id
+		then
 			return false, "inventory_busy"
+		end
+		if session.record.pending_mutation ~= nil then
+			return false, "inventory_recovering"
+		end
+		local valid, validation_error = transfer_rules.validate(session.record, transaction, session.user_id)
+		if not valid then
+			return false, validation_error
 		end
 
 		local expected_revision = session.record.revision
-		local outgoing = transaction.outgoing[tostring(session.user_id)]
-		for _, item in ipairs(outgoing) do
-			local owned = session.record.items[item.id]
-			if owned == nil or not owned.tradable or not utility.deep_equal(owned, item) then
-				return false, "offer_changed"
-			end
-		end
-
-		local conflict = false
+		local denied_reason = nil
 		local ok, saved_or_error = self.gateway:update(self.store, inventory_key(session.user_id), function(current)
 			local record = schema.normalize_inventory(current, session.user_id)
-			if
-				record == nil
-				or record.lease.owner ~= self.server_id
-				or record.lease.token ~= session.lease_token
-				or record.revision ~= expected_revision
-				or record.pending_transaction ~= nil
-			then
-				conflict = true
+			if record == nil then
+				denied_reason = "invalid_inventory"
 				return nil
 			end
-			for _, item in ipairs(outgoing) do
-				if not utility.deep_equal(record.items[item.id], item) then
-					conflict = true
-					return nil
-				end
+			if not owns_lease(record, self.server_id, session) then
+				denied_reason = "lease_lost"
+				return nil
+			end
+			if record.revision ~= expected_revision then
+				denied_reason = "revision_conflict"
+				return nil
+			end
+			if record.pending_transaction ~= nil and record.pending_transaction ~= transaction.id then
+				denied_reason = "inventory_busy"
+				return nil
+			end
+			if record.pending_mutation ~= nil then
+				denied_reason = "inventory_recovering"
+				return nil
+			end
+			local current_valid, current_error = transfer_rules.validate(record, transaction, session.user_id)
+			if not current_valid then
+				denied_reason = current_error
+				return nil
 			end
 			record.pending_transaction = transaction.id
-			record.updated_at = os.time()
+			record.updated_at = math.max(os.time(), record.updated_at)
 			return record
 		end)
 		if not ok then
+			local current = self:_read_consistent(session.user_id)
+			if
+				current ~= nil
+				and owns_lease(current, self.server_id, session)
+				and current.pending_transaction == transaction.id
+			then
+				local current_valid = transfer_rules.validate(current, transaction, session.user_id)
+				if current_valid then
+					session.record = current
+					return true
+				end
+			end
 			return false, saved_or_error
 		end
-		if conflict or saved_or_error == nil then
-			return false, "prepare_conflict"
+		if saved_or_error == nil then
+			return false, denied_reason or "prepare_rejected"
 		end
-		session.record = schema.normalize_inventory(saved_or_error, session.user_id)
+		local saved, reason = schema.normalize_inventory(saved_or_error, session.user_id)
+		if saved == nil then
+			return false, reason or "invalid_saved_record"
+		end
+		session.record = saved
 		return true
 	end)
 end
 
-function repository:rollback(session: any, transaction_id: string)
-	return self:with_lock(session, function()
-		local ok, saved_or_error = self.gateway:update(self.store, inventory_key(session.user_id), function(current)
-			local record = schema.normalize_inventory(current, session.user_id)
-			if record == nil then
-				return nil
-			end
-			if record.pending_transaction == transaction_id then
-				record.pending_transaction = nil
-				record.updated_at = os.time()
-			end
-			return record
-		end)
-		if ok and saved_or_error ~= nil then
-			session.record = schema.normalize_inventory(saved_or_error, session.user_id)
-		end
-		return ok, ok and nil or saved_or_error
-	end)
-end
-
-function repository:rollback_user(user_id: number, transaction_id: string, session: any?)
-	if session ~= nil then
-		return self:rollback(session, transaction_id)
-	end
+function repository:_rollback_user(user_id: number, transaction_id: string, session: any?)
 	local denied_reason = nil
 	local ok, saved_or_error = self.gateway:update(self.store, inventory_key(user_id), function(current)
 		local record = schema.normalize_inventory(current, user_id)
 		if record == nil then
+			denied_reason = "invalid_inventory"
 			return nil
 		end
-		if record.lease.owner ~= "" and record.lease.expires_at > os.time() then
-			denied_reason = "lease_busy"
+		if record.receipts[transaction_id] ~= nil then
+			denied_reason = "transaction_already_applied"
 			return nil
 		end
-		if record.pending_transaction == transaction_id then
-			record.pending_transaction = nil
-			record.updated_at = os.time()
-		end
-		return record
-	end)
-	if not ok then
-		return false, saved_or_error
-	end
-	if saved_or_error == nil then
-		return false, denied_reason or "rollback_rejected"
-	end
-	return true
-end
-
-function repository:apply_transaction(transaction: any, user_id: number, session: any?)
-	local outgoing = transaction.outgoing[tostring(user_id)]
-	local other_user_id = transaction.users[1] == user_id and transaction.users[2] or transaction.users[1]
-	local incoming = transaction.outgoing[tostring(other_user_id)]
-	local denied_reason = nil
-
-	local ok, saved_or_error = self.gateway:update(self.store, inventory_key(user_id), function(current)
-		local record, reason = schema.normalize_inventory(current, user_id)
-		if record == nil then
-			denied_reason = reason
-			return nil
-		end
-		if record.receipts[transaction.id] ~= nil then
-			if record.pending_transaction == transaction.id then
-				record.pending_transaction = nil
-			end
+		if record.pending_transaction ~= transaction_id then
 			return record
 		end
-		if record.pending_transaction ~= transaction.id then
-			denied_reason = "transaction_not_prepared"
-			return nil
-		end
 		if session ~= nil then
-			if record.lease.owner ~= self.server_id or record.lease.token ~= session.lease_token then
+			if not owns_lease(record, self.server_id, session) then
 				denied_reason = "lease_lost"
 				return nil
 			end
@@ -323,43 +633,195 @@ function repository:apply_transaction(transaction: any, user_id: number, session
 			denied_reason = "lease_busy"
 			return nil
 		end
-
-		for _, item in ipairs(outgoing) do
-			if not utility.deep_equal(record.items[item.id], item) then
-				denied_reason = "outgoing_item_changed"
-				return nil
+		record.pending_transaction = nil
+		record.updated_at = math.max(os.time(), record.updated_at)
+		return record
+	end)
+	if not ok then
+		local current = self:_read_consistent(user_id)
+		if
+			current ~= nil
+			and current.receipts[transaction_id] == nil
+			and current.pending_transaction ~= transaction_id
+		then
+			if session == nil or owns_lease(current, self.server_id, session) then
+				if session ~= nil then
+					session.record = current
+				end
+				return true
 			end
 		end
-		for _, item in ipairs(incoming) do
-			if record.items[item.id] ~= nil then
-				denied_reason = "incoming_item_collision"
+		return false, saved_or_error
+	end
+	if saved_or_error == nil then
+		return false, denied_reason or "rollback_rejected"
+	end
+	local saved, reason = schema.normalize_inventory(saved_or_error, user_id)
+	if saved == nil then
+		return false, reason
+	end
+	if session ~= nil then
+		session.record = saved
+	end
+	return true
+end
+
+function repository:rollback(session: any, transaction_id: string)
+	return self:with_lock(session, function()
+		return self:_rollback_user(session.user_id, transaction_id, session)
+	end)
+end
+
+function repository:rollback_user(user_id: number, transaction_id: string, session: any?)
+	if session ~= nil then
+		return self:rollback(session, transaction_id)
+	end
+	return self:_rollback_user(user_id, transaction_id, nil)
+end
+
+function repository:_apply_transaction(transaction: any, user_id: number, session: any?)
+	local denied_reason = nil
+	local ok, saved_or_error = self.gateway:update(self.store, inventory_key(user_id), function(current)
+		local record, reason = schema.normalize_inventory(current, user_id)
+		if record == nil then
+			denied_reason = reason
+			return nil
+		end
+		if session ~= nil then
+			if not owns_lease(record, self.server_id, session) then
+				denied_reason = "lease_lost"
 				return nil
 			end
+		elseif record.lease.owner ~= "" and record.lease.expires_at > os.time() then
+			if record.receipts[transaction.id] ~= nil then
+				return record
+			end
+			denied_reason = "lease_busy"
+			return nil
+		end
+		if record.receipts[transaction.id] ~= nil then
+			return record
+		end
+		if record.pending_transaction ~= transaction.id then
+			denied_reason = "transaction_not_prepared"
+			return nil
 		end
 
+		local valid, validation_error, outgoing, incoming = transfer_rules.validate(record, transaction, user_id)
+		if not valid then
+			denied_reason = validation_error
+			return nil
+		end
 		for _, item in ipairs(outgoing) do
 			record.items[item.id] = nil
 		end
 		for _, item in ipairs(incoming) do
 			record.items[item.id] = utility.deep_copy(item)
 		end
-		record.pending_transaction = nil
 		record.receipts[transaction.id] = os.time()
 		utility.prune_receipts(record.receipts, transaction.id, config.maximum_receipts)
 		record.revision += 1
-		record.updated_at = os.time()
-		return record
+		record.updated_at = math.max(os.time(), record.updated_at)
+		local normalized, postimage_error = schema.normalize_inventory(record, user_id)
+		if normalized == nil then
+			denied_reason = postimage_error or "invalid_postimage"
+			return nil
+		end
+		return normalized
 	end)
 	if not ok then
+		local current = self:_read_consistent(user_id)
+		if current ~= nil and current.receipts[transaction.id] ~= nil then
+			if session ~= nil and owns_lease(current, self.server_id, session) then
+				session.record = current
+			end
+			return true
+		end
 		return false, saved_or_error
 	end
 	if saved_or_error == nil then
 		return false, denied_reason or "apply_rejected"
 	end
+	local saved, reason = schema.normalize_inventory(saved_or_error, user_id)
+	if saved == nil then
+		return false, reason or "invalid_saved_record"
+	end
 	if session ~= nil then
-		session.record = schema.normalize_inventory(saved_or_error, user_id)
+		session.record = saved
 	end
 	return true
+end
+
+function repository:apply_transaction(transaction: any, user_id: number, session: any?)
+	if session ~= nil then
+		return self:with_lock(session, function()
+			if not session.active or session.destroyed or session.record == nil then
+				return false, "not_ready"
+			end
+			return self:_apply_transaction(transaction, user_id, session)
+		end)
+	end
+	return self:_apply_transaction(transaction, user_id, nil)
+end
+
+function repository:_finalize_user(user_id: number, transaction_id: string, session: any?)
+	local denied_reason = nil
+	local ok, saved_or_error = self.gateway:update(self.store, inventory_key(user_id), function(current)
+		local record = schema.normalize_inventory(current, user_id)
+		if record == nil then
+			denied_reason = "invalid_inventory"
+			return nil
+		end
+		if record.pending_transaction ~= transaction_id then
+			return record
+		end
+		if record.receipts[transaction_id] == nil then
+			denied_reason = "missing_transaction_receipt"
+			return nil
+		end
+		if session ~= nil then
+			if not owns_lease(record, self.server_id, session) then
+				denied_reason = "lease_lost"
+				return nil
+			end
+		elseif record.lease.owner ~= "" and record.lease.expires_at > os.time() then
+			denied_reason = "lease_busy"
+			return nil
+		end
+		record.pending_transaction = nil
+		record.updated_at = math.max(os.time(), record.updated_at)
+		return record
+	end)
+	if not ok then
+		local current = self:_read_consistent(user_id)
+		if current ~= nil and current.pending_transaction ~= transaction_id then
+			if session ~= nil and owns_lease(current, self.server_id, session) then
+				session.record = current
+			end
+			return true
+		end
+		return false, saved_or_error
+	end
+	if saved_or_error == nil then
+		return false, denied_reason or "finalize_rejected"
+	end
+	local saved, reason = schema.normalize_inventory(saved_or_error, user_id)
+	if saved == nil then
+		return false, reason
+	end
+	if session ~= nil then
+		session.record = saved
+	end
+	return true
+end
+
+function repository:finalize_user(user_id: number, transaction_id: string, session: any?)
+	if session ~= nil then
+		return self:with_lock(session, function()
+			return self:_finalize_user(user_id, transaction_id, session)
+		end)
+	end
+	return self:_finalize_user(user_id, transaction_id, nil)
 end
 
 function repository:read(user_id: number)
@@ -368,6 +830,10 @@ function repository:read(user_id: number)
 		return nil, raw_or_error
 	end
 	return schema.normalize_inventory(raw_or_error, user_id)
+end
+
+function repository:read_consistent(user_id: number)
+	return self:_read_consistent(user_id)
 end
 
 return repository

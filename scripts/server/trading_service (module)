@@ -11,6 +11,27 @@ local utility = require(script.Parent.Parent.shared:WaitForChild("trading_utilit
 local service = {}
 service.__index = service
 
+local function build_mutation_operation(
+	mutation_id: string,
+	user_id: number,
+	kind: string,
+	payload: any,
+	result: any
+)
+	local now = os.time()
+	return {
+		schema_version = config.mutation_schema_version,
+		id = mutation_id,
+		user_id = user_id,
+		kind = kind,
+		payload = utility.deep_copy(payload),
+		result = result,
+		status = "started",
+		created_at = now,
+		updated_at = now,
+	}
+end
+
 function service.new(inventory_repository: any, transaction_repository: any, coordinator: any, observability: any)
 	local self = setmetatable({}, service)
 	self.inventory_repository = inventory_repository
@@ -18,9 +39,13 @@ function service.new(inventory_repository: any, transaction_repository: any, coo
 	self.coordinator = coordinator
 	self.observability = observability
 	self.sessions = {}
+	self.closing_sessions = {}
 	self.trades = {}
 	self.user_trade = {}
 	self.connections = {}
+	self.commit_workers = {}
+	self.user_reservations = {}
+	self.target_invite_times = {}
 	self.push_remote = nil
 	self.running = false
 	self.stopping = false
@@ -95,17 +120,62 @@ function service:_close_trade(trade: any, reason: string)
 		return
 	end
 	trade.status = "closed"
-	self:_push_trade(trade, "trade_closed", { reason = reason })
 	for _, user_id in ipairs(trade.users) do
 		if self.user_trade[user_id] == trade.id then
 			self.user_trade[user_id] = nil
 		end
 	end
 	self.trades[trade.id] = nil
+	self:_push_trade(trade, "trade_closed", { reason = reason })
 	self.observability.changed_event:Fire("trade_closed", {
 		trade_id = trade.id,
 		reason = reason,
 	})
+end
+
+function service:_expire_trade_if_needed(trade: any): boolean
+	if
+		(trade.status == "pending" or trade.status == "active")
+		and os.time() >= trade.expires_at
+	then
+		self:_close_trade(trade, trade.status == "pending" and "invite_expired" or "trade_expired")
+		return true
+	end
+	return false
+end
+
+function service:_reserve_users(user_ids: { number }, reservation_id: string): boolean
+	for _, user_id in ipairs(user_ids) do
+		if self.user_reservations[user_id] ~= nil then
+			return false
+		end
+	end
+	for _, user_id in ipairs(user_ids) do
+		self.user_reservations[user_id] = reservation_id
+	end
+	return true
+end
+
+function service:_release_users(user_ids: { number }, reservation_id: string)
+	for _, user_id in ipairs(user_ids) do
+		if self.user_reservations[user_id] == reservation_id then
+			self.user_reservations[user_id] = nil
+		end
+	end
+end
+
+function service:_with_user_reservation(user_id: number, callback: () -> ...any)
+	local reservation_id = utility.new_id("reservation_")
+	if not self:_reserve_users({ user_id }, reservation_id) then
+		return false, "temporarily_unavailable"
+	end
+	local packed = table.pack(xpcall(callback, debug.traceback))
+	self:_release_users({ user_id }, reservation_id)
+	if not packed[1] then
+		warn(string.format("[trading/error] reservation user=%d error=%s", user_id, tostring(packed[2])))
+		return false, "internal_error"
+	end
+	return table.unpack(packed, 2, packed.n)
 end
 
 function service:_valid_proximity(left_player: Player, right_player: Player): boolean
@@ -123,15 +193,26 @@ function service:_valid_proximity(left_player: Player, right_player: Player): bo
 end
 
 function service:bootstrap(session: any)
+	local inventory_ready = session.ready and session.record ~= nil
+	if inventory_ready and session.record.pending_mutation ~= nil then
+		local recovered = self.inventory_repository:recover_mutation(session)
+		inventory_ready = recovered == true and session.record.pending_mutation == nil
+	end
 	local trade = nil
 	local trade_id = self.user_trade[session.user_id]
 	if trade_id ~= nil and self.trades[trade_id] ~= nil then
-		trade = self:_trade_snapshot(self.trades[trade_id])
+		local current = self.trades[trade_id]
+		if not self:_expire_trade_if_needed(current) then
+			trade = self:_trade_snapshot(current)
+		else
+			trade_id = nil
+		end
 	end
 	return true, "bootstrapped", {
+		ready = inventory_ready,
 		session = session.remote_session,
 		next_sequence = session.last_sequence + 1,
-		inventory = session.ready and session.record and schema.inventory_snapshot(session.record) or nil,
+		inventory = inventory_ready and schema.inventory_snapshot(session.record) or nil,
 		trade = trade,
 	}
 end
@@ -143,26 +224,35 @@ function service:_invite(session: any, payload: any)
 	if self.user_trade[session.user_id] ~= nil then
 		return false, "already_trading"
 	end
+	if self.user_reservations[session.user_id] ~= nil then
+		return false, "temporarily_unavailable"
+	end
 
 	local target_player = players:GetPlayerByUserId(payload.target_user_id)
 	local target_session = target_player and self.sessions[target_player.UserId]
 	if target_session == nil or not target_session.active or not target_session.ready or target_session.record == nil then
 		return false, "target_unavailable"
 	end
-	if self.user_trade[target_session.user_id] ~= nil then
-		return false, "target_busy"
-	end
-	if session.record == nil or not session.record.settings.trading_enabled or not target_session.record.settings.trading_enabled then
-		return false, "trading_disabled"
-	end
-	if session.player.AccountAge < config.minimum_account_age_days or target_session.player.AccountAge < config.minimum_account_age_days then
-		return false, "account_too_new"
-	end
-	if session.record.pending_transaction ~= nil or target_session.record.pending_transaction ~= nil then
-		return false, "inventory_busy"
-	end
-	if not self:_valid_proximity(session.player, target_session.player) then
-		return false, "too_far_away"
+	local last_target_invite = self.target_invite_times[target_session.user_id]
+	if
+		self.user_trade[target_session.user_id] ~= nil
+		or self.user_reservations[target_session.user_id] ~= nil
+		or session.record == nil
+		or not session.record.settings.trading_enabled
+		or not target_session.record.settings.trading_enabled
+		or session.player.AccountAge < config.minimum_account_age_days
+		or target_session.player.AccountAge < config.minimum_account_age_days
+		or session.record.pending_transaction ~= nil
+		or target_session.record.pending_transaction ~= nil
+		or session.record.pending_mutation ~= nil
+		or target_session.record.pending_mutation ~= nil
+		or not self:_valid_proximity(session.player, target_session.player)
+		or (
+			last_target_invite ~= nil
+			and os.clock() - last_target_invite < config.target_invite_cooldown_seconds
+		)
+	then
+		return false, "target_unavailable"
 	end
 
 	local trade_id = utility.new_id("trade_")
@@ -187,6 +277,7 @@ function service:_invite(session: any, payload: any)
 	self.trades[trade_id] = trade
 	self.user_trade[session.user_id] = trade_id
 	self.user_trade[target_session.user_id] = trade_id
+	self.target_invite_times[target_session.user_id] = os.clock()
 	self:_push_trade(trade, "trade_invited")
 
 	task.delay(config.invite_lifetime_seconds + 1, function()
@@ -203,6 +294,9 @@ function service:_respond(session: any, payload: any)
 	if trade == nil or not table.find(trade.users, session.user_id) then
 		return false, "trade_not_found"
 	end
+	if self:_expire_trade_if_needed(trade) then
+		return false, "trade_expired"
+	end
 	if trade.status ~= "pending" then
 		return false, "trade_not_pending"
 	end
@@ -214,12 +308,38 @@ function service:_respond(session: any, payload: any)
 		return true, "declined"
 	end
 
-	local inviter_session = self.sessions[trade.inviter_user_id]
-	if inviter_session == nil or not inviter_session.active or not inviter_session.ready then
+	local left_session = self.sessions[trade.users[1]]
+	local right_session = self.sessions[trade.users[2]]
+	if
+		(left_session ~= nil and self.user_reservations[left_session.user_id] ~= nil)
+		or (right_session ~= nil and self.user_reservations[right_session.user_id] ~= nil)
+	then
+		return false, "temporarily_unavailable"
+	end
+	if
+		left_session == nil
+		or right_session == nil
+		or not left_session.active
+		or not right_session.active
+		or not left_session.ready
+		or not right_session.ready
+		or left_session.record == nil
+		or right_session.record == nil
+		or left_session.record.pending_transaction ~= nil
+		or right_session.record.pending_transaction ~= nil
+		or left_session.record.pending_mutation ~= nil
+		or right_session.record.pending_mutation ~= nil
+		or not left_session.record.settings.trading_enabled
+		or not right_session.record.settings.trading_enabled
+		or self.user_reservations[left_session.user_id] ~= nil
+		or self.user_reservations[right_session.user_id] ~= nil
+		or self.user_trade[left_session.user_id] ~= trade.id
+		or self.user_trade[right_session.user_id] ~= trade.id
+	then
 		self:_close_trade(trade, "participant_unavailable")
 		return false, "participant_unavailable"
 	end
-	if not self:_valid_proximity(session.player, inviter_session.player) then
+	if not self:_valid_proximity(left_session.player, right_session.player) then
 		self:_close_trade(trade, "too_far_away")
 		return false, "too_far_away"
 	end
@@ -241,6 +361,9 @@ function service:_set_offer(session: any, payload: any)
 	if trade == nil or not table.find(trade.users, session.user_id) then
 		return false, "trade_not_found"
 	end
+	if self:_expire_trade_if_needed(trade) then
+		return false, "trade_expired"
+	end
 	if trade.status ~= "active" then
 		return false, "trade_not_active"
 	end
@@ -251,11 +374,26 @@ function service:_set_offer(session: any, payload: any)
 	local left_session = self.sessions[trade.users[1]]
 	local right_session = self.sessions[trade.users[2]]
 	if
+		(left_session ~= nil and self.user_reservations[left_session.user_id] ~= nil)
+		or (right_session ~= nil and self.user_reservations[right_session.user_id] ~= nil)
+	then
+		return false, "temporarily_unavailable"
+	end
+	if
 		left_session == nil
 		or right_session == nil
 		or not left_session.ready
 		or not right_session.ready
-		or session.record == nil
+		or not left_session.active
+		or not right_session.active
+		or left_session.record == nil
+		or right_session.record == nil
+		or left_session.record.pending_transaction ~= nil
+		or right_session.record.pending_transaction ~= nil
+		or left_session.record.pending_mutation ~= nil
+		or right_session.record.pending_mutation ~= nil
+		or self.user_trade[left_session.user_id] ~= trade.id
+		or self.user_trade[right_session.user_id] ~= trade.id
 	then
 		self:_close_trade(trade, "participant_unavailable")
 		return false, "participant_unavailable"
@@ -302,34 +440,78 @@ function service:_finish_local_commit(trade: any, transaction: any)
 end
 
 function service:_watch_commit(trade: any)
+	if self.commit_workers[trade.id] ~= nil then
+		return
+	end
+	local worker_token = {}
+	self.commit_workers[trade.id] = worker_token
 	task.spawn(function()
-		local committed, result = self.coordinator:commit(trade)
-		if committed then
-			self:_finish_local_commit(trade, result)
-			return
-		end
-
-		for _ = 1, 20 do
-			task.wait(1.5)
-			local transaction = self.transaction_repository:get(trade.id)
-			if transaction ~= nil and transaction.state == "completed" then
-				for _, user_id in ipairs(transaction.users) do
-					local session = self.sessions[user_id]
-					if session ~= nil then
-						local record = self.inventory_repository:read(user_id)
-						if record ~= nil then
-							session.record = record
-						end
-					end
-				end
-				self:_finish_local_commit(trade, transaction)
-				return
-			elseif transaction ~= nil and transaction.state == "aborted" then
-				self:_close_trade(trade, "commit_aborted")
+		local packed = table.pack(xpcall(function()
+			local committed, result = self.coordinator:commit(trade)
+			if committed then
+				self:_finish_local_commit(trade, result)
 				return
 			end
+
+			self:_push_trade(trade, "trade_recovering")
+			local missing_reads = 0
+			local attempt = 0
+			while
+				self.running
+				and self.commit_workers[trade.id] == worker_token
+				and self.trades[trade.id] == trade
+			do
+				attempt += 1
+				self.coordinator:start_recovery(trade.id)
+				local transaction, read_error = self.transaction_repository:get_consistent(trade.id)
+				if transaction ~= nil then
+					missing_reads = 0
+					if transaction.state == "completed" then
+						local recovered = self.coordinator:recover_once(trade.id)
+						if recovered then
+							for _, user_id in ipairs(transaction.users) do
+								local session = self.sessions[user_id]
+								if session ~= nil and session.active and session.ready then
+									self.inventory_repository:refresh(session)
+								end
+							end
+							self:_finish_local_commit(trade, transaction)
+							return
+						end
+					elseif transaction.state == "aborted" then
+						local recovered = self.coordinator:recover_once(trade.id)
+						if recovered then
+							self:_close_trade(trade, "commit_aborted")
+							return
+						end
+					end
+				elseif read_error == "not_found" then
+					missing_reads += 1
+					if missing_reads >= 3 then
+						self.transaction_repository:unindex(trade.id)
+						self:_close_trade(trade, "commit_not_created")
+						return
+					end
+				end
+				task.wait(math.min(10, 1 + attempt * 0.5))
+			end
+		end, debug.traceback))
+		if self.commit_workers[trade.id] == worker_token then
+			self.commit_workers[trade.id] = nil
 		end
-		self:_push_trade(trade, "trade_recovering")
+		if not packed[1] then
+			warn(string.format("[trading/error] commit watcher=%s error=%s", trade.id, tostring(packed[2])))
+			self.observability:emit_alert("commit_watcher_failed", "critical", {
+				transaction_id = trade.id,
+			}, "commit_watcher:" .. trade.id)
+			if self.running and self.trades[trade.id] == trade then
+				task.delay(1, function()
+					if self.running and self.trades[trade.id] == trade then
+						self:_watch_commit(trade)
+					end
+				end)
+			end
+		end
 	end)
 end
 
@@ -337,6 +519,9 @@ function service:_confirm(session: any, payload: any)
 	local trade = self.trades[payload.trade_id]
 	if trade == nil or not table.find(trade.users, session.user_id) then
 		return false, "trade_not_found"
+	end
+	if self:_expire_trade_if_needed(trade) then
+		return false, "trade_expired"
 	end
 	if trade.status ~= "active" then
 		return false, "trade_not_active"
@@ -347,7 +532,30 @@ function service:_confirm(session: any, payload: any)
 
 	local left_session = self.sessions[trade.users[1]]
 	local right_session = self.sessions[trade.users[2]]
-	if left_session == nil or right_session == nil or not left_session.ready or not right_session.ready then
+	if
+		(left_session ~= nil and self.user_reservations[left_session.user_id] ~= nil)
+		or (right_session ~= nil and self.user_reservations[right_session.user_id] ~= nil)
+	then
+		return false, "temporarily_unavailable"
+	end
+	if
+		left_session == nil
+		or right_session == nil
+		or not left_session.active
+		or not right_session.active
+		or not left_session.ready
+		or not right_session.ready
+		or left_session.record == nil
+		or right_session.record == nil
+		or left_session.record.pending_transaction ~= nil
+		or right_session.record.pending_transaction ~= nil
+		or left_session.record.pending_mutation ~= nil
+		or right_session.record.pending_mutation ~= nil
+		or not left_session.record.settings.trading_enabled
+		or not right_session.record.settings.trading_enabled
+		or self.user_trade[left_session.user_id] ~= trade.id
+		or self.user_trade[right_session.user_id] ~= trade.id
+	then
 		self:_close_trade(trade, "participant_unavailable")
 		return false, "participant_unavailable"
 	end
@@ -358,6 +566,14 @@ function service:_confirm(session: any, payload: any)
 
 	trade.confirmed[tostring(session.user_id)] = true
 	if trade.confirmed[tostring(trade.users[1])] and trade.confirmed[tostring(trade.users[2])] then
+		if
+			#trade.offers[tostring(trade.users[1])].ids == 0
+			and #trade.offers[tostring(trade.users[2])].ids == 0
+		then
+			trade.confirmed[tostring(trade.users[1])] = false
+			trade.confirmed[tostring(trade.users[2])] = false
+			return false, "empty_trade"
+		end
 		trade.status = "committing"
 		self:_push_trade(trade, "trade_locked")
 		self:_watch_commit(trade)
@@ -372,6 +588,9 @@ function service:_cancel(session: any, payload: any)
 	if trade == nil or not table.find(trade.users, session.user_id) then
 		return false, "trade_not_found"
 	end
+	if self:_expire_trade_if_needed(trade) then
+		return false, "trade_expired"
+	end
 	if trade.status == "committing" then
 		return false, "commit_in_progress"
 	end
@@ -383,7 +602,12 @@ function service:_sync(session: any)
 	self:_push_inventory(session, "sync")
 	local trade_id = self.user_trade[session.user_id]
 	if trade_id ~= nil and self.trades[trade_id] ~= nil then
-		self:_send(session.player, "trade_sync", { trade = self:_trade_snapshot(self.trades[trade_id]) })
+		local trade = self.trades[trade_id]
+		if not self:_expire_trade_if_needed(trade) then
+			self:_send(session.player, "trade_sync", { trade = self:_trade_snapshot(trade) })
+		else
+			trade_id = nil
+		end
 	end
 	return true, "synchronized", {
 		inventory_revision = session.record and session.record.revision or 0,
@@ -392,6 +616,12 @@ function service:_sync(session: any)
 end
 
 function service:handle_action(session: any, action: string, payload: any)
+	if session.record ~= nil and session.record.pending_mutation ~= nil then
+		local recovered, recovery_error = self.inventory_repository:recover_mutation(session)
+		if not recovered then
+			return false, recovery_error or "inventory_recovering"
+		end
+	end
 	if action == "bootstrap" then
 		return self:bootstrap(session)
 	elseif action == "invite" then
@@ -427,6 +657,7 @@ function service:_new_session(player: Player)
 		last_sequence = 0,
 		security_score = 0,
 		security_updated_at = os.clock(),
+		destroyed = false,
 		next_lease_refresh_at = os.clock() + 5,
 		lease_failures = 0,
 		lease_refreshing = false,
@@ -434,8 +665,38 @@ function service:_new_session(player: Player)
 end
 
 function service:_load_player(player: Player)
-	if self.sessions[player.UserId] ~= nil then
-		return
+	local existing = self.sessions[player.UserId]
+	if existing ~= nil then
+		if existing.player == player then
+			return
+		end
+		local deadline = os.clock() + config.session_replacement_wait_seconds
+		repeat
+			task.wait(0.05)
+		until self.sessions[player.UserId] ~= existing or player.Parent ~= players or os.clock() >= deadline
+		if player.Parent ~= players then
+			return
+		end
+		if self.sessions[player.UserId] ~= nil then
+			player:Kick("your previous server session is still closing; please rejoin")
+			return
+		end
+	end
+	local closing = self.closing_sessions[player.UserId]
+	if closing ~= nil then
+		local deadline = os.clock() + config.session_replacement_wait_seconds
+		repeat
+			task.wait(0.05)
+		until self.closing_sessions[player.UserId] ~= closing
+			or player.Parent ~= players
+			or os.clock() >= deadline
+		if player.Parent ~= players then
+			return
+		end
+		if self.closing_sessions[player.UserId] ~= nil or self.sessions[player.UserId] ~= nil then
+			player:Kick("your previous server session is still closing; please rejoin")
+			return
+		end
 	end
 	local session = self:_new_session(player)
 	self.sessions[player.UserId] = session
@@ -443,6 +704,10 @@ function service:_load_player(player: Player)
 	local acquired, acquire_error = self.inventory_repository:acquire(session)
 	if not acquired then
 		session.active = false
+		if self.sessions[session.user_id] == session then
+			self.sessions[session.user_id] = nil
+		end
+		self.inventory_repository:destroy_session(session)
 		if player.Parent == players then
 			local message = acquire_error == "lease_busy"
 				and "your inventory is active on another server; please rejoin"
@@ -453,7 +718,30 @@ function service:_load_player(player: Player)
 	end
 	if not session.active or player.Parent ~= players then
 		self.inventory_repository:release(session)
+		if self.sessions[session.user_id] == session then
+			self.sessions[session.user_id] = nil
+		end
+		self.inventory_repository:destroy_session(session)
 		return
+	end
+	if session.record ~= nil and session.record.pending_mutation ~= nil then
+		local recovered, recovery_error = self.inventory_repository:recover_mutation(session)
+		if not recovered then
+			session.active = false
+			self.inventory_repository:release(session)
+			if self.sessions[session.user_id] == session then
+				self.sessions[session.user_id] = nil
+			end
+			self.inventory_repository:destroy_session(session)
+			self.observability:emit_alert("mutation_recovery_failed", "critical", {
+				user_id = session.user_id,
+				error = tostring(recovery_error),
+			}, "mutation_recovery:" .. tostring(session.user_id))
+			if player.Parent == players then
+				player:Kick("your inventory is recovering; please rejoin shortly")
+			end
+			return
+		end
 	end
 
 	if session.record ~= nil and session.record.pending_transaction ~= nil then
@@ -463,7 +751,12 @@ function service:_load_player(player: Player)
 			task.wait(0.25)
 		until session.record.pending_transaction == nil or os.clock() >= deadline or not session.active
 		if session.record.pending_transaction ~= nil then
+			session.active = false
 			self.inventory_repository:release(session)
+			if self.sessions[session.user_id] == session then
+				self.sessions[session.user_id] = nil
+			end
+			self.inventory_repository:destroy_session(session)
 			if player.Parent == players then
 				player:Kick("your inventory is recovering; please rejoin shortly")
 			end
@@ -482,6 +775,11 @@ function service:_remove_player(player: Player)
 	end
 	session.active = false
 	session.ready = false
+	self.closing_sessions[session.user_id] = session
+	if self.sessions[session.user_id] == session then
+		self.sessions[session.user_id] = nil
+	end
+	self.target_invite_times[session.user_id] = nil
 
 	local trade_id = self.user_trade[session.user_id]
 	local trade = trade_id and self.trades[trade_id]
@@ -490,11 +788,21 @@ function service:_remove_player(player: Player)
 	end
 
 	local pending_transaction = session.record and session.record.pending_transaction
-	self.inventory_repository:release(session)
-	if self.sessions[session.user_id] == session then
-		self.sessions[session.user_id] = nil
+	local release_call_ok, release_result, release_detail = xpcall(function()
+		return self.inventory_repository:release(session)
+	end, debug.traceback)
+	if not release_call_ok or release_result ~= true then
+		local release_error = release_call_ok and release_detail or release_result
+		warn(string.format("[trading/error] removal user=%d error=%s", session.user_id, tostring(release_error)))
+		self.observability:emit_alert("session_release_failed", "critical", {
+			user_id = session.user_id,
+			error = tostring(release_error),
+		}, "session_release:" .. tostring(session.user_id))
 	end
-	session.unlocked:Destroy()
+	self.inventory_repository:destroy_session(session)
+	if self.closing_sessions[session.user_id] == session then
+		self.closing_sessions[session.user_id] = nil
+	end
 	if pending_transaction ~= nil then
 		self.coordinator:start_recovery(pending_transaction)
 	elseif trade ~= nil and trade.status == "committing" then
@@ -510,18 +818,28 @@ function service:_start_lease_loop()
 				break
 			end
 
-			local budget_ok, budget = pcall(
+			local read_budget_ok, read_budget = pcall(
 				data_store_service.GetRequestBudgetForRequestType,
 				data_store_service,
-				Enum.DataStoreRequestType.UpdateAsync
+				Enum.DataStoreRequestType.StandardRead
 			)
-			local capacity = budget_ok
-				and math.min(config.maximum_lease_refreshes_per_tick, math.max(0, budget - config.lease_budget_reserve))
+			local write_budget_ok, write_budget = pcall(
+				data_store_service.GetRequestBudgetForRequestType,
+				data_store_service,
+				Enum.DataStoreRequestType.StandardWrite
+			)
+			local available_budget = read_budget_ok and write_budget_ok and math.min(read_budget, write_budget) or 0
+			local capacity = read_budget_ok and write_budget_ok
+				and math.min(
+					config.maximum_lease_refreshes_per_tick,
+					math.max(0, available_budget - config.lease_budget_reserve)
+				)
 				or 0
 			local due = {}
 			for _, session in pairs(self.sessions) do
 				if
 					session.active
+					and not session.destroyed
 					and session.record ~= nil
 					and not session.lease_refreshing
 					and session.next_lease_refresh_at <= os.clock()
@@ -537,7 +855,14 @@ function service:_start_lease_loop()
 				local session = due[index]
 				session.lease_refreshing = true
 				task.spawn(function()
-					local ok, refresh_error = self.inventory_repository:refresh(session)
+					local packed = table.pack(xpcall(function()
+						return self.inventory_repository:refresh(session)
+					end, debug.traceback))
+					if self.sessions[session.user_id] ~= session or session.destroyed or not session.active then
+						return
+					end
+					local ok = packed[1] and packed[2] == true
+					local refresh_error = packed[1] and packed[3] or "refresh_error"
 					if ok then
 						session.lease_failures = 0
 						session.next_lease_refresh_at = os.clock() + config.lease_refresh_seconds
@@ -558,6 +883,18 @@ function service:_start_lease_loop()
 					session.lease_refreshing = false
 				end)
 			end
+			for index = capacity + 1, #due do
+				local session = due[index]
+				if session.record.lease.expires_at <= os.time() + config.lease_retry_seconds then
+					session.ready = false
+					self.observability:emit_alert("lease_scheduler_starved", "critical", {
+						user_id = session.user_id,
+					}, "lease_starved:" .. tostring(session.user_id))
+					if session.player.Parent == players then
+						session.player:Kick("inventory connection lost; please rejoin")
+					end
+				end
+			end
 		end
 	end)
 end
@@ -574,6 +911,24 @@ function service:_start_sweep_loop()
 					}, "transaction_sweep")
 				end
 			end
+		end
+	end)
+end
+
+function service:_start_index_migration_worker()
+	task.spawn(function()
+		local attempt = 0
+		while self.running do
+			attempt += 1
+			local ok, result = self.transaction_repository:migrate_open_index(self.coordinator.server_id)
+			if ok then
+				return
+			end
+			self.observability:emit_alert("open_index_migration_incomplete", "warning", {
+				error = tostring(result),
+				attempt = attempt,
+			}, "open_index_migration")
+			task.wait(math.min(60, 5 * attempt))
 		end
 	end)
 end
@@ -601,7 +956,12 @@ function service:start()
 	end)
 	if subscribed then
 		table.insert(self.connections, subscription)
+	else
+		self.observability:emit_alert("recovery_subscription_failed", "critical", {
+			error = tostring(subscription),
+		}, "recovery_subscription")
 	end
+	self:_start_index_migration_worker()
 	self:_start_lease_loop()
 	self:_start_sweep_loop()
 end
@@ -612,6 +972,7 @@ function service:stop()
 	end
 	self.stopping = true
 	self.running = false
+	self.coordinator:stop()
 	for _, connection in ipairs(self.connections) do
 		connection:Disconnect()
 	end
@@ -621,20 +982,35 @@ function service:stop()
 	for _, session in pairs(self.sessions) do
 		remaining += 1
 		task.spawn(function()
-			session.active = false
-			session.ready = false
-			local pending = session.record and session.record.pending_transaction
-			self.inventory_repository:release(session)
-			if pending ~= nil then
-				self.coordinator:recover_once(pending)
+			local packed = table.pack(xpcall(function()
+				session.active = false
+				session.ready = false
+				local pending = session.record and session.record.pending_transaction
+				self.inventory_repository:release(session)
+				if pending ~= nil then
+					self.coordinator:recover_once(pending)
+				end
+			end, debug.traceback))
+			if self.sessions[session.user_id] == session then
+				self.sessions[session.user_id] = nil
 			end
+			self.inventory_repository:destroy_session(session)
 			remaining -= 1
+			if not packed[1] then
+				warn(string.format("[trading/error] shutdown user=%d error=%s", session.user_id, tostring(packed[2])))
+			end
 		end)
 	end
 	local deadline = os.clock() + 25
 	while remaining > 0 and os.clock() < deadline do
 		task.wait(0.05)
 	end
+	table.clear(self.trades)
+	table.clear(self.user_trade)
+	table.clear(self.commit_workers)
+	table.clear(self.user_reservations)
+	table.clear(self.target_invite_times)
+	table.clear(self.closing_sessions)
 	self.stopping = false
 end
 
@@ -644,86 +1020,138 @@ function service:get_inventory(value: any)
 	if session == nil or not session.ready or session.record == nil then
 		return false, "not_ready"
 	end
-	return true, utility.deep_copy(session.record)
+	return true, {
+		user_id = session.user_id,
+		revision = session.record.revision,
+		items = utility.deep_copy(session.record.items),
+		settings = utility.deep_copy(session.record.settings),
+		pending_transaction = session.record.pending_transaction,
+		pending_mutation = session.record.pending_mutation,
+		updated_at = session.record.updated_at,
+	}
 end
 
-function service:grant_item(value: any, raw_item: any)
+function service:grant_item(value: any, raw_item: any, mutation_id: any?)
 	local user_id = typeof(value) == "Instance" and value:IsA("Player") and value.UserId or value
 	local session = type(user_id) == "number" and self.sessions[user_id] or nil
 	if session == nil then
 		return false, "not_ready"
 	end
-	if self.user_trade[session.user_id] ~= nil then
-		return false, "trade_active"
+	if mutation_id ~= nil and not utility.is_mutation_id(mutation_id) then
+		return false, "invalid_mutation_id"
 	end
-	local item, item_error = schema.normalize_item(raw_item, true)
+	local selected_mutation_id = mutation_id or utility.new_id("mut_")
+	if type(raw_item) ~= "table" then
+		return false, "invalid_item_shape"
+	end
+	if config.require_server_generated_item_ids and raw_item.id ~= nil then
+		return false, "item_id_server_generated"
+	end
+	local item_source = utility.deep_copy(raw_item)
+	local generated_created_at = item_source.created_at == nil
+	item_source.id = "item_" .. string.sub(selected_mutation_id, 5)
+	local item, item_error = schema.normalize_item(item_source, true)
 	if item == nil then
 		return false, item_error
 	end
-	local ok, result = self.inventory_repository:mutate(session, function(record)
-		if record.items[item.id] ~= nil then
-			return false, "duplicate_item_id"
+	return self:_with_user_reservation(session.user_id, function()
+		local operation = build_mutation_operation(selected_mutation_id, session.user_id, "grant_item", {
+			item = item,
+			generated_created_at = generated_created_at,
+		}, item.id)
+		local ok, result = self.inventory_repository:mutate(session, function(record, canonical_operation)
+			local trade_id = self.user_trade[session.user_id]
+			local trade = trade_id and self.trades[trade_id]
+			if trade ~= nil and trade.status ~= "pending" then
+				return false, "trade_active"
+			end
+			local canonical_item = canonical_operation.payload.item
+			if record.items[canonical_item.id] ~= nil then
+				return false, "duplicate_item_id"
+			end
+			local count = 0
+			for _ in pairs(record.items) do
+				count += 1
+			end
+			if count >= config.maximum_inventory_items then
+				return false, "inventory_full"
+			end
+			record.items[canonical_item.id] = utility.deep_copy(canonical_item)
+			return true, canonical_item.id
+		end, operation)
+		if ok then
+			self:_push_inventory(session, "item_granted")
 		end
-		local count = 0
-		for _ in pairs(record.items) do
-			count += 1
-		end
-		if count >= config.maximum_inventory_items then
-			return false, "inventory_full"
-		end
-		record.items[item.id] = item
-		return true, item.id
+		return ok, result
 	end)
-	if ok then
-		self:_push_inventory(session, "item_granted")
-	end
-	return ok, result
 end
 
-function service:revoke_item(value: any, item_id: any)
+function service:revoke_item(value: any, item_id: any, mutation_id: any?)
 	local user_id = typeof(value) == "Instance" and value:IsA("Player") and value.UserId or value
 	local session = type(user_id) == "number" and self.sessions[user_id] or nil
 	if session == nil or not utility.is_safe_identifier(item_id, 8, config.maximum_item_id_bytes) then
 		return false, session == nil and "not_ready" or "invalid_item_id"
 	end
-	if self.user_trade[session.user_id] ~= nil then
-		return false, "trade_active"
+	if mutation_id ~= nil and not utility.is_mutation_id(mutation_id) then
+		return false, "invalid_mutation_id"
 	end
-	local ok, result = self.inventory_repository:mutate(session, function(record)
-		if record.items[item_id] == nil then
-			return false, "item_not_found"
+	local selected_mutation_id = mutation_id or utility.new_id("mut_")
+	return self:_with_user_reservation(session.user_id, function()
+		local operation = build_mutation_operation(selected_mutation_id, session.user_id, "revoke_item", {
+			item_id = item_id,
+		}, item_id)
+		local ok, result = self.inventory_repository:mutate(session, function(record, canonical_operation)
+			local trade_id = self.user_trade[session.user_id]
+			local trade = trade_id and self.trades[trade_id]
+			if trade ~= nil and trade.status ~= "pending" then
+				return false, "trade_active"
+			end
+			local canonical_item_id = canonical_operation.payload.item_id
+			if record.items[canonical_item_id] == nil then
+				return false, "item_not_found"
+			end
+			record.items[canonical_item_id] = nil
+			return true, canonical_item_id
+		end, operation)
+		if ok then
+			self:_push_inventory(session, "item_revoked")
 		end
-		record.items[item_id] = nil
-		return true, item_id
+		return ok, result
 	end)
-	if ok then
-		self:_push_inventory(session, "item_revoked")
-	end
-	return ok, result
 end
 
-function service:set_trading_enabled(value: any, enabled: any)
+function service:set_trading_enabled(value: any, enabled: any, mutation_id: any?)
 	local user_id = typeof(value) == "Instance" and value:IsA("Player") and value.UserId or value
 	local session = type(user_id) == "number" and self.sessions[user_id] or nil
 	if session == nil or type(enabled) ~= "boolean" then
 		return false, session == nil and "not_ready" or "invalid_enabled"
 	end
-	local trade_id = self.user_trade[session.user_id]
-	local trade = trade_id and self.trades[trade_id]
-	if trade ~= nil then
-		if trade.status == "committing" then
-			return false, "commit_in_progress"
+	if mutation_id ~= nil and not utility.is_mutation_id(mutation_id) then
+		return false, "invalid_mutation_id"
+	end
+	local selected_mutation_id = mutation_id or utility.new_id("mut_")
+	return self:_with_user_reservation(session.user_id, function()
+		local operation = build_mutation_operation(selected_mutation_id, session.user_id, "set_trading_enabled", {
+			enabled = enabled,
+		}, enabled)
+		local ok, result = self.inventory_repository:mutate(session, function(record, canonical_operation)
+			local trade_id = self.user_trade[session.user_id]
+			local trade = trade_id and self.trades[trade_id]
+			if trade ~= nil then
+				if trade.status == "committing" then
+					return false, "commit_in_progress"
+				end
+				self:_close_trade(trade, "trading_disabled")
+			end
+			local canonical_enabled = canonical_operation.payload.enabled
+			record.settings.trading_enabled = canonical_enabled
+			return true, canonical_enabled
+		end, operation)
+		if ok then
+			self:_push_inventory(session, "settings_changed")
 		end
-		self:_close_trade(trade, "trading_disabled")
-	end
-	local ok, result = self.inventory_repository:mutate(session, function(record)
-		record.settings.trading_enabled = enabled
-		return true, enabled
+		return ok, result
 	end)
-	if ok then
-		self:_push_inventory(session, "settings_changed")
-	end
-	return ok, result
 end
 
 function service:cancel_trade(value: any, reason: any)

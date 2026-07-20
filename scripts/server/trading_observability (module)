@@ -17,6 +17,8 @@ function observability.new(gateway: any, changed_event: BindableEvent)
 	self.audit_store = data_store_service:GetDataStore(config.audit_store_name)
 	self.alert_dedupe = {}
 	self.recent_alerts = {}
+	self.alert_worker_count = 0
+	self.audit_worker_count = 0
 	self.metrics = {
 		started_at = os.time(),
 		alerts_emitted = 0,
@@ -25,6 +27,7 @@ function observability.new(gateway: any, changed_event: BindableEvent)
 		commits_recovered = 0,
 		commits_failed = 0,
 		remote_rejections = 0,
+		telemetry_dropped = 0,
 	}
 	return self
 end
@@ -32,10 +35,22 @@ end
 function observability:emit_alert(code: string, severity: string, context: any, dedupe_key: string?)
 	local now = os.time()
 	local key = dedupe_key or code
-	if self.alert_dedupe[key] and now - self.alert_dedupe[key] < 30 then
+	local sample_seconds = code == "remote_request_rejected" and config.security_alert_sample_seconds or 30
+	if self.alert_dedupe[key] and now - self.alert_dedupe[key] < sample_seconds then
 		return
 	end
 	self.alert_dedupe[key] = now
+	local dedupe_count = 0
+	for dedupe_key, timestamp in pairs(self.alert_dedupe) do
+		dedupe_count += 1
+		if now - timestamp > config.security_alert_sample_seconds * 2 then
+			self.alert_dedupe[dedupe_key] = nil
+		end
+	end
+	if dedupe_count > 512 then
+		table.clear(self.alert_dedupe)
+		self.alert_dedupe[key] = now
+	end
 
 	local alert = {
 		id = utility.new_id("alert_"),
@@ -51,25 +66,36 @@ function observability:emit_alert(code: string, severity: string, context: any, 
 		table.remove(self.recent_alerts, 1)
 	end
 	self.changed_event:Fire("alert", utility.deep_copy(alert))
+	if self.alert_worker_count >= config.maximum_alert_workers then
+		self.metrics.telemetry_dropped += 1
+		return
+	end
+	self.alert_worker_count += 1
 
 	task.spawn(function()
-		local ok = self.gateway:update(self.alert_store, "recent", function(current)
-			local alerts = type(current) == "table" and current or {}
-			for _, existing in ipairs(alerts) do
-				if existing.id == alert.id then
-					return alerts
+		local packed = table.pack(xpcall(function()
+			local ok = self.gateway:update(self.alert_store, "recent", function(current)
+				local alerts = type(current) == "table" and current or {}
+				for _, existing in ipairs(alerts) do
+					if existing.id == alert.id then
+						return alerts
+					end
 				end
+				table.insert(alerts, alert)
+				while #alerts > 100 do
+					table.remove(alerts, 1)
+				end
+				return alerts
+			end)
+			if not ok then
+				warn(string.format("[trading/alert] persistence failed code=%s", code))
 			end
-			table.insert(alerts, alert)
-			while #alerts > 100 do
-				table.remove(alerts, 1)
-			end
-			return alerts
-		end)
-		if not ok then
-			warn(string.format("[trading/alert] persistence failed code=%s", code))
+			pcall(messaging_service.PublishAsync, messaging_service, config.alert_topic, alert)
+		end, debug.traceback))
+		self.alert_worker_count = math.max(0, self.alert_worker_count - 1)
+		if not packed[1] then
+			warn(string.format("[trading/alert] worker failed code=%s", code))
 		end
-		pcall(messaging_service.PublishAsync, messaging_service, config.alert_topic, alert)
 	end)
 end
 
@@ -85,32 +111,46 @@ function observability:get_durable_alerts()
 end
 
 function observability:append_audit(transaction_id: string, event_name: string, details: any)
+	if self.audit_worker_count >= config.maximum_audit_workers then
+		self.metrics.telemetry_dropped += 1
+		return
+	end
 	local event_id = utility.new_id("event_")
 	local key = "audit_" .. transaction_id
+	self.audit_worker_count += 1
 	task.spawn(function()
-		local ok = self.gateway:update(self.audit_store, key, function(current)
-			local record = type(current) == "table" and current or { events = {} }
-			for _, event in ipairs(record.events) do
-				if event.id == event_id then
-					return record
+		local packed = table.pack(xpcall(function()
+			local ok = self.gateway:update(self.audit_store, key, function(current)
+				local record = type(current) == "table" and current or { events = {} }
+				if type(record.events) ~= "table" then
+					record = { events = {} }
 				end
+				for _, event in ipairs(record.events) do
+					if event.id == event_id then
+						return record
+					end
+				end
+				table.insert(record.events, {
+					id = event_id,
+					name = event_name,
+					details = utility.deep_copy(details),
+					created_at = os.time(),
+				})
+				while #record.events > 64 do
+					table.remove(record.events, 1)
+				end
+				return record
+			end)
+			if not ok then
+				self:emit_alert("audit_write_failed", "warning", {
+					transaction_id = transaction_id,
+					event_name = event_name,
+				}, "audit:" .. transaction_id)
 			end
-			table.insert(record.events, {
-				id = event_id,
-				name = event_name,
-				details = utility.deep_copy(details),
-				created_at = os.time(),
-			})
-			while #record.events > 64 do
-				table.remove(record.events, 1)
-			end
-			return record
-		end)
-		if not ok then
-			self:emit_alert("audit_write_failed", "warning", {
-				transaction_id = transaction_id,
-				event_name = event_name,
-			}, "audit:" .. transaction_id)
+		end, debug.traceback))
+		self.audit_worker_count = math.max(0, self.audit_worker_count - 1)
+		if not packed[1] then
+			warn(string.format("[trading/audit] worker failed transaction=%s", transaction_id))
 		end
 	end)
 end

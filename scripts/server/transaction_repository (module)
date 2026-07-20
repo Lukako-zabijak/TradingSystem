@@ -9,11 +9,112 @@ local utility = require(script.Parent.Parent.shared:WaitForChild("trading_utilit
 local repository = {}
 repository.__index = repository
 
-local open_index_key = "open_transactions"
-local maximum_open_transactions = 500
+local transitions = table.freeze({
+	preparing = table.freeze({ aborting = true, committing = true }),
+	aborting = table.freeze({ aborted = true }),
+	committing = table.freeze({ completed = true }),
+	completed = table.freeze({}),
+	aborted = table.freeze({}),
+})
+
+local legacy_open_index_key = "open_transactions"
+local index_migration_key = "sharded_index_migration_v1"
+local index_migration_version = 1
+local maximum_safe_integer = 9007199254740991
+local index_migration_keys = table.freeze({
+	version = true,
+	status = true,
+	owner = true,
+	token = true,
+	epoch = true,
+	expires_at = true,
+	updated_at = true,
+	completed_at = true,
+})
 
 local function transaction_key(transaction_id: string): string
 	return "tx_" .. transaction_id
+end
+
+local function shard_number(transaction_id: string): number
+	local hash = 5381
+	for index = 1, #transaction_id do
+		hash = (hash * 33 + string.byte(transaction_id, index)) % 2147483647
+	end
+	return (hash % config.open_transaction_shards) + 1
+end
+
+local function open_index_key(transaction_id: string): string
+	return string.format("open_%02d", shard_number(transaction_id))
+end
+
+local function fence_matches(transaction: any, fence: any): boolean
+	return type(fence) == "table"
+		and transaction.coordinator.owner == fence.owner
+		and transaction.coordinator.token == fence.token
+		and transaction.coordinator.epoch == fence.epoch
+end
+
+local function next_timestamp(previous: number): number
+	return math.max(os.time(), previous)
+end
+
+local function normalize_index_migration(raw_state: any): (any?, string?)
+	if
+		type(raw_state) ~= "table"
+		or not utility.has_only_keys(raw_state, index_migration_keys, 8)
+		or raw_state.version ~= index_migration_version
+		or (raw_state.status ~= "running" and raw_state.status ~= "completed")
+		or type(raw_state.owner) ~= "string"
+		or type(raw_state.token) ~= "string"
+		or not utility.is_safe_integer(raw_state.epoch)
+		or raw_state.epoch < 1
+		or not utility.is_safe_integer(raw_state.expires_at)
+		or raw_state.expires_at < 0
+		or not utility.is_safe_integer(raw_state.updated_at)
+		or raw_state.updated_at < 0
+	then
+		return nil, "invalid_index_migration"
+	end
+
+	if raw_state.status == "running" then
+		if
+			not utility.is_safe_identifier(raw_state.owner, 8, 128)
+			or not utility.is_safe_identifier(raw_state.token, 16, 64)
+			or raw_state.expires_at == 0
+			or raw_state.completed_at ~= nil
+		then
+			return nil, "invalid_index_migration"
+		end
+	elseif
+		raw_state.owner ~= ""
+		or raw_state.token ~= ""
+		or raw_state.expires_at ~= 0
+		or not utility.is_safe_integer(raw_state.completed_at)
+		or raw_state.completed_at < 0
+		or raw_state.completed_at > raw_state.updated_at
+	then
+		return nil, "invalid_index_migration"
+	end
+
+	return {
+		version = index_migration_version,
+		status = raw_state.status,
+		owner = raw_state.owner,
+		token = raw_state.token,
+		epoch = raw_state.epoch,
+		expires_at = raw_state.expires_at,
+		updated_at = raw_state.updated_at,
+		completed_at = raw_state.completed_at,
+	}, nil
+end
+
+local function migration_fence_matches(state: any, fence: any): boolean
+	return type(fence) == "table"
+		and state.status == "running"
+		and state.owner == fence.owner
+		and state.token == fence.token
+		and state.epoch == fence.epoch
 end
 
 function repository.new(gateway: any, observability: any)
@@ -22,66 +123,470 @@ function repository.new(gateway: any, observability: any)
 	self.observability = observability
 	self.store = data_store_service:GetDataStore(config.transaction_store_name)
 	self.open_store = data_store_service:GetDataStore(config.open_transaction_store_name)
+	self.index_migration_token = utility.new_id("migration_")
+	self.index_migration_running = false
 	return self
 end
 
-function repository:_set_indexed(transaction_id: string, indexed: boolean)
-	local ok, result = self.gateway:update(self.open_store, open_index_key, function(current)
-		local index = type(current) == "table" and current or {}
+function repository:_set_indexed(transaction_id: string, indexed: boolean, touch: boolean?)
+	local denied_reason = nil
+	local ok, result = self.gateway:update(self.open_store, open_index_key(transaction_id), function(current)
+		local index = {}
+		local count = 0
+		if type(current) == "table" then
+			for id, timestamp in pairs(current) do
+				if utility.is_trade_id(id) and utility.is_safe_integer(timestamp) and timestamp >= 0 then
+					index[id] = timestamp
+					count += 1
+				end
+			end
+		end
+
 		if indexed then
-			index[transaction_id] = os.time()
+			if index[transaction_id] == nil then
+				if count >= config.maximum_open_transactions_per_shard then
+					denied_reason = "open_index_full"
+					return nil
+				end
+				index[transaction_id] = os.time()
+			elseif touch then
+				index[transaction_id] = os.time()
+			end
 		else
 			index[transaction_id] = nil
 		end
-
-		local entries = {}
-		for id, timestamp in pairs(index) do
-			table.insert(entries, { id = id, timestamp = timestamp })
-		end
-		if #entries > maximum_open_transactions then
-			table.sort(entries, function(left, right)
-				return left.timestamp < right.timestamp
-			end)
-			for position = 1, #entries - maximum_open_transactions do
-				index[entries[position].id] = nil
-			end
-		end
 		return index
 	end)
-	return ok, result
+	if not ok then
+		return false, result
+	end
+	if result == nil then
+		return false, denied_reason or "open_index_rejected"
+	end
+	return true
+end
+
+function repository:unindex(transaction_id: string)
+	local unindexed, index_error = self:_set_indexed(transaction_id, false)
+	if not unindexed then
+		return false, index_error
+	end
+	local legacy_removed, legacy_error = self:_remove_legacy_entry(transaction_id)
+	if not legacy_removed then
+		return false, legacy_error
+	end
+	return true
+end
+
+function repository:_read_index_migration_consistent()
+	local ok, raw_or_error = self.gateway:get_consistent(self.open_store, index_migration_key)
+	if not ok then
+		return nil, raw_or_error
+	end
+	if raw_or_error == nil then
+		return nil, "index_migration_not_found"
+	end
+	return normalize_index_migration(raw_or_error)
+end
+
+function repository:_claim_index_migration(owner: string)
+	if not utility.is_safe_identifier(owner, 8, 128) then
+		return nil, "invalid_index_migration_owner"
+	end
+
+	local token = self.index_migration_token
+	local denied_reason = nil
+	local ok, saved_or_error = self.gateway:update(self.open_store, index_migration_key, function(current)
+		local now = os.time()
+		if current == nil then
+			return {
+				version = index_migration_version,
+				status = "running",
+				owner = owner,
+				token = token,
+				epoch = 1,
+				expires_at = now + config.index_migration_lease_seconds,
+				updated_at = now,
+				completed_at = nil,
+			}
+		end
+
+		local state, state_error = normalize_index_migration(current)
+		if state == nil then
+			denied_reason = state_error
+			return nil
+		end
+		if state.status == "completed" then
+			return state
+		end
+		if state.owner == owner and state.token == token then
+			state.expires_at = now + config.index_migration_lease_seconds
+			state.updated_at = math.max(now, state.updated_at)
+			return state
+		end
+		if state.expires_at > now then
+			denied_reason = "index_migration_busy"
+			return nil
+		end
+		if state.epoch >= maximum_safe_integer then
+			denied_reason = "index_migration_epoch_exhausted"
+			return nil
+		end
+
+		state.owner = owner
+		state.token = token
+		state.epoch += 1
+		state.expires_at = now + config.index_migration_lease_seconds
+		state.updated_at = math.max(now, state.updated_at)
+		return state
+	end)
+	if not ok then
+		local current, read_error = self:_read_index_migration_consistent()
+		if
+			current ~= nil
+			and (
+				current.status == "completed"
+				or (current.owner == owner and current.token == token)
+			)
+		then
+			return current
+		end
+		return nil, read_error or saved_or_error
+	end
+	if saved_or_error == nil then
+		return nil, denied_reason or "index_migration_claim_rejected"
+	end
+	return normalize_index_migration(saved_or_error)
+end
+
+function repository:_renew_index_migration(fence: any)
+	local denied_reason = nil
+	local ok, saved_or_error = self.gateway:update(self.open_store, index_migration_key, function(current)
+		local state, state_error = normalize_index_migration(current)
+		if state == nil then
+			denied_reason = state_error
+			return nil
+		end
+		if state.status == "completed" then
+			return state
+		end
+		if not migration_fence_matches(state, fence) then
+			denied_reason = "index_migration_fenced"
+			return nil
+		end
+		local now = os.time()
+		state.expires_at = now + config.index_migration_lease_seconds
+		state.updated_at = math.max(now, state.updated_at)
+		return state
+	end)
+	if not ok then
+		local current, read_error = self:_read_index_migration_consistent()
+		if current ~= nil and (current.status == "completed" or migration_fence_matches(current, fence)) then
+			return current
+		end
+		return nil, read_error or saved_or_error
+	end
+	if saved_or_error == nil then
+		return nil, denied_reason or "index_migration_renew_rejected"
+	end
+	return normalize_index_migration(saved_or_error)
+end
+
+function repository:_complete_index_migration(fence: any)
+	local denied_reason = nil
+	local ok, saved_or_error = self.gateway:update(self.open_store, index_migration_key, function(current)
+		local state, state_error = normalize_index_migration(current)
+		if state == nil then
+			denied_reason = state_error
+			return nil
+		end
+		if state.status == "completed" then
+			return state
+		end
+		if not migration_fence_matches(state, fence) then
+			denied_reason = "index_migration_fenced"
+			return nil
+		end
+		local now = os.time()
+		state.status = "completed"
+		state.owner = ""
+		state.token = ""
+		state.expires_at = 0
+		state.updated_at = math.max(now, state.updated_at)
+		state.completed_at = state.updated_at
+		return state
+	end)
+	if not ok then
+		local current, read_error = self:_read_index_migration_consistent()
+		if current ~= nil and current.status == "completed" then
+			return current
+		end
+		return nil, read_error or saved_or_error
+	end
+	if saved_or_error == nil then
+		return nil, denied_reason or "index_migration_completion_rejected"
+	end
+	return normalize_index_migration(saved_or_error)
+end
+
+function repository:_has_index_marker_consistent(transaction_id: string)
+	local ok, index_or_error = self.gateway:get_consistent(self.open_store, open_index_key(transaction_id))
+	if not ok then
+		return nil, index_or_error
+	end
+	if index_or_error == nil then
+		return false, nil
+	end
+	if type(index_or_error) ~= "table" then
+		return nil, "invalid_open_index"
+	end
+	local timestamp = index_or_error[transaction_id]
+	return utility.is_safe_integer(timestamp) and timestamp >= 0, nil
+end
+
+function repository:_ensure_index_marker(transaction_id: string)
+	local indexed, index_error = self:_set_indexed(transaction_id, true)
+	if indexed then
+		return true
+	end
+	local present, verify_error = self:_has_index_marker_consistent(transaction_id)
+	if present == true then
+		return true
+	end
+	return false, verify_error or index_error or "index_marker_unconfirmed"
+end
+
+function repository:_read_legacy_index_consistent()
+	local ok, index_or_error = self.gateway:get_consistent(self.open_store, legacy_open_index_key)
+	if not ok then
+		return nil, index_or_error
+	end
+	if index_or_error == nil then
+		return {}, nil
+	end
+	if type(index_or_error) ~= "table" then
+		return nil, "invalid_legacy_open_index"
+	end
+	return index_or_error, nil
+end
+
+function repository:_remove_legacy_entry(entry_key: any)
+	local denied_reason = nil
+	local ok, saved_or_error = self.gateway:update(self.open_store, legacy_open_index_key, function(current)
+		if current == nil then
+			return {}
+		end
+		if type(current) ~= "table" then
+			denied_reason = "invalid_legacy_open_index"
+			return nil
+		end
+		local updated = utility.deep_copy(current)
+		updated[entry_key] = nil
+		return updated
+	end)
+	if not ok then
+		local current, read_error = self:_read_legacy_index_consistent()
+		if current ~= nil and current[entry_key] == nil then
+			return true
+		end
+		return false, read_error or saved_or_error
+	end
+	if saved_or_error == nil then
+		return false, denied_reason or "legacy_index_remove_rejected"
+	end
+	if type(saved_or_error) ~= "table" or saved_or_error[entry_key] ~= nil then
+		return false, "legacy_index_remove_unconfirmed"
+	end
+	return true
+end
+
+function repository:_drain_legacy_index(fence: any)
+	while true do
+		local renewed, renew_error = self:_renew_index_migration(fence)
+		if renewed == nil then
+			return false, renew_error
+		end
+		if renewed.status == "completed" then
+			return true
+		end
+
+		local legacy, read_error = self:_read_legacy_index_consistent()
+		if legacy == nil then
+			return false, read_error
+		end
+		local entry_key = next(legacy)
+		if entry_key == nil then
+			return true
+		end
+
+		if utility.is_trade_id(entry_key) then
+			local indexed, index_error = self:_ensure_index_marker(entry_key)
+			if not indexed then
+				return false, index_error
+			end
+		end
+		local removed, remove_error = self:_remove_legacy_entry(entry_key)
+		if not removed then
+			return false, remove_error
+		end
+	end
+end
+
+function repository:_scan_transaction_keys(fence: any)
+	local listed, pages_or_error = self.gateway:list_keys(
+		self.store,
+		"tx_",
+		config.index_migration_page_size,
+		true
+	)
+	if not listed then
+		return false, pages_or_error
+	end
+	local pages = pages_or_error
+
+	while true do
+		local page_ok, page_or_error = pcall(function()
+			return pages:GetCurrentPage()
+		end)
+		if not page_ok or type(page_or_error) ~= "table" then
+			return false, page_ok and "invalid_transaction_key_page" or page_or_error
+		end
+
+		for _, entry in ipairs(page_or_error) do
+			local key_ok, key_name = pcall(function()
+				return entry.KeyName
+			end)
+			if not key_ok or type(key_name) ~= "string" then
+				return false, key_ok and "invalid_transaction_key" or key_name
+			end
+			local transaction_id = string.sub(key_name, 4)
+			if utility.is_trade_id(transaction_id) then
+				local transaction, read_error = self:get_consistent(transaction_id)
+				if transaction == nil then
+					if read_error ~= "not_found" then
+						return false, read_error
+					end
+				elseif transaction.state ~= "completed" and transaction.state ~= "aborted" then
+					local renewed, renew_error = self:_renew_index_migration(fence)
+					if renewed == nil then
+						return false, renew_error
+					end
+					if renewed.status == "completed" then
+						return true
+					end
+					local indexed, index_error = self:_ensure_index_marker(transaction_id)
+					if not indexed then
+						return false, index_error
+					end
+				end
+			end
+		end
+
+		if pages.IsFinished then
+			break
+		end
+		local renewed, renew_error = self:_renew_index_migration(fence)
+		if renewed == nil then
+			return false, renew_error
+		end
+		if renewed.status == "completed" then
+			return true
+		end
+		local advanced, advance_error = self.gateway:advance_pages(pages)
+		if not advanced then
+			return false, advance_error
+		end
+	end
+	return true
+end
+
+function repository:_run_open_index_migration(owner: string)
+	local claimed, claim_error = self:_claim_index_migration(owner)
+	if claimed == nil then
+		return false, claim_error
+	end
+	if claimed.status == "completed" then
+		return true, "completed"
+	end
+	local fence = {
+		owner = claimed.owner,
+		token = claimed.token,
+		epoch = claimed.epoch,
+	}
+
+	local drained, drain_error = self:_drain_legacy_index(fence)
+	if not drained then
+		return false, drain_error
+	end
+	local scanned, scan_error = self:_scan_transaction_keys(fence)
+	if not scanned then
+		return false, scan_error
+	end
+	local final_drain, final_drain_error = self:_drain_legacy_index(fence)
+	if not final_drain then
+		return false, final_drain_error
+	end
+	local completed, completion_error = self:_complete_index_migration(fence)
+	if completed == nil then
+		return false, completion_error
+	end
+	return completed.status == "completed", completed.status
+end
+
+function repository:migrate_open_index(owner: string)
+	if self.index_migration_running then
+		return false, "index_migration_running"
+	end
+	self.index_migration_running = true
+	local packed = table.pack(xpcall(function()
+		return self:_run_open_index_migration(owner)
+	end, debug.traceback))
+	self.index_migration_running = false
+	if not packed[1] then
+		return false, packed[2]
+	end
+	return table.unpack(packed, 2, packed.n)
 end
 
 function repository:create(transaction: any)
+	local candidate, candidate_error = schema.normalize_transaction(transaction, transaction.id)
+	if candidate == nil then
+		return false, candidate_error
+	end
+
+	local indexed, index_error = self:_set_indexed(transaction.id, true)
+	if not indexed then
+		return false, index_error
+	end
+
 	local already_exists = false
 	local ok, saved_or_error = self.gateway:update(self.store, transaction_key(transaction.id), function(current)
 		if current ~= nil then
 			already_exists = true
 			return current
 		end
-		return utility.deep_copy(transaction)
+		return utility.deep_copy(candidate)
 	end)
 	if not ok then
 		return false, saved_or_error
-	end
-	if already_exists then
-		local existing, existing_error = schema.normalize_transaction(saved_or_error, transaction.id)
-		if existing ~= nil and utility.deep_equal(existing, transaction) then
-			return true, existing
-		end
-		return false, existing_error or "transaction_exists"
 	end
 
 	local normalized, reason = schema.normalize_transaction(saved_or_error, transaction.id)
 	if normalized == nil then
 		return false, reason
 	end
-	self:_set_indexed(transaction.id, true)
-	self.observability:append_audit(transaction.id, "created", { state = normalized.state })
+	if already_exists and not utility.deep_equal(normalized, candidate) then
+		return false, "transaction_exists"
+	end
+	self.observability:append_audit(transaction.id, already_exists and "rediscovered" or "created", {
+		state = normalized.state,
+	})
 	return true, normalized
 end
 
-function repository:get(transaction_id: string)
-	local ok, raw_or_error = self.gateway:get(self.store, transaction_key(transaction_id))
+function repository:_get(transaction_id: string, consistent: boolean)
+	local getter = consistent and self.gateway.get_consistent or self.gateway.get
+	local ok, raw_or_error = getter(self.gateway, self.store, transaction_key(transaction_id))
 	if not ok then
 		return nil, raw_or_error
 	end
@@ -91,7 +596,114 @@ function repository:get(transaction_id: string)
 	return schema.normalize_transaction(raw_or_error, transaction_id)
 end
 
-function repository:transition(transaction_id: string, allowed_from: { [string]: boolean }, next_state: string)
+function repository:get(transaction_id: string)
+	return self:_get(transaction_id, false)
+end
+
+function repository:get_consistent(transaction_id: string)
+	return self:_get(transaction_id, true)
+end
+
+function repository:claim(transaction_id: string, owner: string, token: string)
+	if
+		not utility.is_safe_identifier(owner, 8, 128)
+		or not utility.is_safe_identifier(token, 16, 64)
+	then
+		return nil, "invalid_coordinator_identity"
+	end
+	local denied_reason = nil
+	local ok, saved_or_error = self.gateway:update(self.store, transaction_key(transaction_id), function(current)
+		local now = os.time()
+		local transaction, reason = schema.normalize_transaction(current, transaction_id)
+		if transaction == nil then
+			denied_reason = reason
+			return nil
+		end
+		if transaction.state == "completed" or transaction.state == "aborted" then
+			return transaction
+		end
+		if transaction.coordinator.owner == owner and transaction.coordinator.token == token then
+			transaction.coordinator.expires_at = now + config.coordinator_lease_seconds
+			transaction.updated_at = next_timestamp(transaction.updated_at)
+			return transaction
+		end
+		if transaction.coordinator.owner ~= "" and transaction.coordinator.expires_at > now then
+			denied_reason = "coordinator_busy"
+			return nil
+		end
+		if transaction.coordinator.epoch >= maximum_safe_integer then
+			denied_reason = "coordinator_epoch_exhausted"
+			return nil
+		end
+		transaction.coordinator = {
+			owner = owner,
+			token = token,
+			epoch = transaction.coordinator.epoch + 1,
+			expires_at = now + config.coordinator_lease_seconds,
+		}
+		transaction.updated_at = next_timestamp(transaction.updated_at)
+		return transaction
+	end)
+	if not ok then
+		local current, read_error = self:get_consistent(transaction_id)
+		if
+			current ~= nil
+			and (
+				current.state == "completed"
+				or current.state == "aborted"
+				or (current.coordinator.owner == owner and current.coordinator.token == token)
+			)
+		then
+			if current.state ~= "completed" and current.state ~= "aborted" then
+				self:_set_indexed(transaction_id, true, true)
+			end
+			return current
+		end
+		return nil, read_error or saved_or_error
+	end
+	if saved_or_error == nil then
+		return nil, denied_reason or "coordinator_claim_rejected"
+	end
+	local transaction, reason = schema.normalize_transaction(saved_or_error, transaction_id)
+	if transaction ~= nil and transaction.state ~= "completed" and transaction.state ~= "aborted" then
+		self:_set_indexed(transaction_id, true, true)
+	end
+	return transaction, reason
+end
+
+function repository:renew(transaction_id: string, fence: any)
+	local denied_reason = nil
+	local ok, saved_or_error = self.gateway:update(self.store, transaction_key(transaction_id), function(current)
+		local transaction, reason = schema.normalize_transaction(current, transaction_id)
+		if transaction == nil then
+			denied_reason = reason
+			return nil
+		end
+		if transaction.state == "completed" or transaction.state == "aborted" then
+			return transaction
+		end
+		if not fence_matches(transaction, fence) then
+			denied_reason = "coordinator_fenced"
+			return nil
+		end
+		transaction.coordinator.expires_at = os.time() + config.coordinator_lease_seconds
+		transaction.updated_at = next_timestamp(transaction.updated_at)
+		return transaction
+	end)
+	if not ok then
+		return nil, saved_or_error
+	end
+	if saved_or_error == nil then
+		return nil, denied_reason or "coordinator_renew_rejected"
+	end
+	local transaction, reason = schema.normalize_transaction(saved_or_error, transaction_id)
+	if transaction ~= nil and transaction.state ~= "completed" and transaction.state ~= "aborted" then
+		self:_set_indexed(transaction_id, true, true)
+	end
+	return transaction, reason
+end
+
+function repository:transition(transaction_id: string, fence: any, next_state: string)
 	local denied_reason = nil
 	local ok, saved_or_error = self.gateway:update(self.store, transaction_key(transaction_id), function(current)
 		local transaction, reason = schema.normalize_transaction(current, transaction_id)
@@ -102,14 +714,19 @@ function repository:transition(transaction_id: string, allowed_from: { [string]:
 		if transaction.state == next_state then
 			return transaction
 		end
-		if not allowed_from[transaction.state] then
+		if not fence_matches(transaction, fence) then
+			denied_reason = "coordinator_fenced"
+			return nil
+		end
+		local allowed = transitions[transaction.state]
+		if allowed == nil or allowed[next_state] ~= true then
 			denied_reason = "invalid_transition"
 			return nil
 		end
 		transaction.state = next_state
-		transaction.updated_at = os.time()
+		transaction.updated_at = next_timestamp(transaction.updated_at)
 		if next_state == "completed" or next_state == "aborted" then
-			transaction.terminal_at = os.time()
+			transaction.terminal_at = transaction.updated_at
 		end
 		return transaction
 	end)
@@ -124,63 +741,117 @@ function repository:transition(transaction_id: string, allowed_from: { [string]:
 	if transaction == nil then
 		return nil, reason
 	end
-	if transaction.state == "completed" or transaction.state == "aborted" then
-		self:_set_indexed(transaction_id, false)
+	if transaction.state ~= "completed" and transaction.state ~= "aborted" then
+		self:_set_indexed(transaction_id, true, true)
 	end
 	self.observability:append_audit(transaction_id, "transitioned", { state = transaction.state })
 	return transaction
 end
 
-function repository:mark_progress(transaction_id: string, section: string, user_id: number, value: boolean)
+function repository:mark_progress(transaction_id: string, fence: any, section: string, user_id: number)
+	if section ~= "prepared" and section ~= "applied" then
+		return false, "invalid_progress_section"
+	end
+	local denied_reason = nil
 	local ok, saved_or_error = self.gateway:update(self.store, transaction_key(transaction_id), function(current)
 		local transaction = schema.normalize_transaction(current, transaction_id)
 		if transaction == nil then
+			denied_reason = "invalid_transaction"
 			return nil
 		end
-		local progress_section = transaction.progress[section]
-		if type(progress_section) ~= "table" then
+		if not fence_matches(transaction, fence) then
+			denied_reason = "coordinator_fenced"
 			return nil
 		end
-		progress_section[tostring(user_id)] = value
-		transaction.updated_at = os.time()
+		local user_key = tostring(user_id)
+		if transaction.users[1] ~= user_id and transaction.users[2] ~= user_id then
+			denied_reason = "invalid_progress_user"
+			return nil
+		end
+		transaction.progress[section][user_key] = true
+		transaction.updated_at = next_timestamp(transaction.updated_at)
 		return transaction
 	end)
 	if not ok or saved_or_error == nil then
-		return false, ok and "progress_rejected" or saved_or_error
+		return false, ok and (denied_reason or "progress_rejected") or saved_or_error
 	end
+	self:_set_indexed(transaction_id, true, true)
 	return true
 end
 
 function repository:note_recovery(transaction_id: string, last_error: string?)
+	local message = tostring(last_error or "")
+	if #message > config.maximum_recovery_error_bytes then
+		message = string.sub(message, 1, config.maximum_recovery_error_bytes)
+	end
+	if not utility.is_valid_utf8(message) then
+		message = "invalid_error_text"
+	end
 	local ok, saved_or_error = self.gateway:update(self.store, transaction_key(transaction_id), function(current)
 		local transaction = schema.normalize_transaction(current, transaction_id)
-		if transaction == nil then
+		if transaction == nil or transaction.state == "completed" or transaction.state == "aborted" then
 			return nil
 		end
-		transaction.progress.recovery_count += 1
-		transaction.progress.last_error = last_error or ""
-		transaction.updated_at = os.time()
+		transaction.progress.recovery_count = math.min(
+			config.maximum_recovery_count,
+			transaction.progress.recovery_count + 1
+		)
+		transaction.progress.last_error = message
+		transaction.updated_at = next_timestamp(transaction.updated_at)
 		return transaction
 	end)
-	return ok and saved_or_error ~= nil
+	if ok and saved_or_error ~= nil then
+		self:_set_indexed(transaction_id, true, true)
+		return true
+	end
+	return false
 end
 
 function repository:list_open()
-	local ok, index_or_error = self.gateway:get(self.open_store, open_index_key)
-	if not ok then
-		return nil, index_or_error
-	end
-	if type(index_or_error) ~= "table" then
-		return {}
+	local result = {}
+	local seen = {}
+	local function append_entries(index: any)
+		if index == nil then
+			return true
+		end
+		if type(index) ~= "table" then
+			return false
+		end
+		for transaction_id, timestamp in pairs(index) do
+			if not seen[transaction_id] and utility.is_trade_id(transaction_id) then
+				seen[transaction_id] = true
+				table.insert(result, {
+					id = transaction_id,
+					timestamp = utility.is_safe_integer(timestamp) and timestamp >= 0 and timestamp or 0,
+				})
+			end
+		end
+		return true
 	end
 
-	local result = {}
-	for transaction_id, timestamp in pairs(index_or_error) do
-		if utility.is_trade_id(transaction_id) and utility.is_safe_integer(timestamp) then
-			table.insert(result, { id = transaction_id, timestamp = timestamp })
+	for shard = 1, config.open_transaction_shards do
+		local key = string.format("open_%02d", shard)
+		local ok, index_or_error = self.gateway:get_consistent(self.open_store, key)
+		if not ok then
+			return nil, index_or_error
+		end
+		if not append_entries(index_or_error) then
+			return nil, "invalid_open_index"
 		end
 	end
+
+	local legacy, legacy_error = self:_read_legacy_index_consistent()
+	if legacy == nil then
+		return nil, legacy_error
+	end
+	if not append_entries(legacy) then
+		return nil, "invalid_legacy_open_index"
+	end
+
 	table.sort(result, function(left, right)
+		if left.timestamp == right.timestamp then
+			return left.id < right.id
+		end
 		return left.timestamp < right.timestamp
 	end)
 	return result

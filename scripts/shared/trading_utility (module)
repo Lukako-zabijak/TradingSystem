@@ -5,7 +5,8 @@ local http_service = game:GetService("HttpService")
 local utility = {}
 
 function utility.new_id(prefix: string): string
-	return prefix .. string.lower(string.gsub(http_service:GenerateGUID(false), "%-", ""))
+	local compact_guid = string.gsub(http_service:GenerateGUID(false), "%-", "")
+	return prefix .. string.lower(compact_guid)
 end
 
 function utility.is_finite_number(value: any): boolean
@@ -25,10 +26,7 @@ function utility.is_valid_utf8(value: any): boolean
 end
 
 function utility.is_safe_identifier(value: any, minimum: number, maximum: number): boolean
-	if not utility.is_valid_utf8(value) then
-		return false
-	end
-	if #value < minimum or #value > maximum then
+	if type(value) ~= "string" or #value < minimum or #value > maximum then
 		return false
 	end
 	return string.match(value, "^[%w_%.:%-]+$") ~= nil
@@ -87,7 +85,7 @@ function utility.deep_equal(left: any, right: any, seen: { [any]: any }?): boole
 	return true
 end
 
-function utility.has_only_keys(value: any, allowed: { [string]: boolean }, maximum: number): boolean
+function utility.has_only_keys(value: any, allowed: any, maximum: number): boolean
 	if type(value) ~= "table" then
 		return false
 	end
@@ -103,7 +101,7 @@ function utility.has_only_keys(value: any, allowed: { [string]: boolean }, maxim
 end
 
 function utility.prune_receipts(receipts: { [string]: number }, protected_id: string, maximum: number)
-	local entries = {}
+	local entries: { { id: string, timestamp: number } } = {}
 	for id, timestamp in pairs(receipts) do
 		table.insert(entries, { id = id, timestamp = timestamp })
 	end
@@ -111,7 +109,7 @@ function utility.prune_receipts(receipts: { [string]: number }, protected_id: st
 		return
 	end
 
-	table.sort(entries, function(left, right)
+	table.sort(entries, function(left: { id: string, timestamp: number }, right: { id: string, timestamp: number })
 		if left.id == protected_id then
 			return false
 		end

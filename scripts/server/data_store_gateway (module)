@@ -19,10 +19,10 @@ export type metrics = {
 }
 
 local request_types = {
-	update = Enum.DataStoreRequestType.UpdateAsync,
-	get = Enum.DataStoreRequestType.GetAsync,
-	list = Enum.DataStoreRequestType.ListAsync,
-	remove = Enum.DataStoreRequestType.SetIncrementAsync,
+	update = table.freeze({ Enum.DataStoreRequestType.StandardRead, Enum.DataStoreRequestType.StandardWrite }),
+	get = table.freeze({ Enum.DataStoreRequestType.StandardRead }),
+	list = table.freeze({ Enum.DataStoreRequestType.StandardList }),
+	remove = table.freeze({ Enum.DataStoreRequestType.StandardRemove }),
 }
 
 local function retry_delay(attempt: number): number
@@ -44,11 +44,22 @@ function gateway.new()
 	return self
 end
 
-function gateway:_wait_for_budget(request_type: Enum.DataStoreRequestType, timeout_seconds: number): boolean
+function gateway:_wait_for_budget(request_type_list: { Enum.DataStoreRequestType }, timeout_seconds: number): boolean
 	local deadline = os.clock() + timeout_seconds
 	repeat
-		local ok, budget = pcall(data_store_service.GetRequestBudgetForRequestType, data_store_service, request_type)
-		if ok and budget > 0 then
+		local has_budget = true
+		for _, request_type in ipairs(request_type_list) do
+			local ok, budget = pcall(
+				data_store_service.GetRequestBudgetForRequestType,
+				data_store_service,
+				request_type
+			)
+			if not ok or budget <= 0 then
+				has_budget = false
+				break
+			end
+		end
+		if has_budget then
 			return true
 		end
 		self.metrics.budget_waits += 1
@@ -95,6 +106,15 @@ function gateway:get(store: GlobalDataStore, key: string, attempts: number?)
 	end)
 end
 
+function gateway:get_consistent(store: GlobalDataStore, key: string, attempts: number?)
+	self.metrics.gets += 1
+	return self:_run("get", attempts or config.read_attempts, function()
+		local options = Instance.new("DataStoreGetOptions")
+		options.UseCache = false
+		return store:GetAsync(key, options)
+	end)
+end
+
 function gateway:remove(store: GlobalDataStore, key: string)
 	self.metrics.removes += 1
 	return self:_run("remove", config.write_attempts, function()
@@ -102,10 +122,18 @@ function gateway:remove(store: GlobalDataStore, key: string)
 	end)
 end
 
-function gateway:list_keys(store: DataStore, prefix: string, page_size: number)
+function gateway:list_keys(store: DataStore, prefix: string, page_size: number, exclude_deleted: boolean?)
 	self.metrics.lists += 1
 	return self:_run("list", config.read_attempts, function()
-		return store:ListKeysAsync(prefix, page_size)
+		return store:ListKeysAsync(prefix, page_size, "", exclude_deleted == true)
+	end)
+end
+
+function gateway:advance_pages(pages: DataStoreKeyPages)
+	self.metrics.lists += 1
+	return self:_run("list", 1, function()
+		pages:AdvanceToNextPageAsync()
+		return true
 	end)
 end
 

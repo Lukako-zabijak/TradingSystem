@@ -9,6 +9,29 @@ local utility = require(script.Parent.Parent.shared:WaitForChild("trading_utilit
 local coordinator = {}
 coordinator.__index = coordinator
 
+local function usable_session(session: any): boolean
+	return session ~= nil
+		and session.active
+		and session.ready
+		and not session.destroyed
+		and session.record ~= nil
+end
+
+local function recovery_session(session: any): boolean
+	return session ~= nil
+		and session.active
+		and not session.destroyed
+		and session.record ~= nil
+		and session.record.lease.expires_at > os.time()
+end
+
+local function same_fence(transaction: any, fence: any): boolean
+	return type(fence) == "table"
+		and transaction.coordinator.owner == fence.owner
+		and transaction.coordinator.token == fence.token
+		and transaction.coordinator.epoch == fence.epoch
+end
+
 function coordinator.new(inventory_repository: any, transaction_repository: any, observability: any, server_id: string)
 	local self = setmetatable({}, coordinator)
 	self.inventory_repository = inventory_repository
@@ -17,6 +40,9 @@ function coordinator.new(inventory_repository: any, transaction_repository: any,
 	self.server_id = server_id
 	self.sessions = {}
 	self.recovery_workers = {}
+	self.recovery_worker_count = 0
+	self.active_transactions = {}
+	self.running = true
 	return self
 end
 
@@ -26,9 +52,10 @@ end
 
 function coordinator:build_transaction(trade: any)
 	local outgoing = {}
+	local item_count = 0
 	for _, user_id in ipairs(trade.users) do
 		local session = self.sessions[user_id]
-		if session == nil or session.record == nil then
+		if not usable_session(session) then
 			return nil, "participant_unavailable"
 		end
 		local items = {}
@@ -37,9 +64,13 @@ function coordinator:build_transaction(trade: any)
 			if item == nil or not item.tradable then
 				return nil, "offer_changed"
 			end
+			item_count += 1
 			table.insert(items, utility.deep_copy(item))
 		end
 		outgoing[tostring(user_id)] = items
+	end
+	if item_count == 0 then
+		return nil, "empty_trade"
 	end
 
 	local now = os.time()
@@ -47,12 +78,18 @@ function coordinator:build_transaction(trade: any)
 		schema_version = config.transaction_schema_version,
 		protocol_revision = config.protocol_revision,
 		id = trade.id,
-		state = "prepared",
+		state = "preparing",
 		users = { trade.users[1], trade.users[2] },
 		outgoing = outgoing,
 		created_at = now,
 		updated_at = now,
 		server_id = self.server_id,
+		coordinator = {
+			owner = self.server_id,
+			token = utility.new_id("coord_"),
+			epoch = 1,
+			expires_at = now + config.coordinator_lease_seconds,
+		},
 		progress = {
 			prepared = {},
 			applied = {},
@@ -63,43 +100,85 @@ function coordinator:build_transaction(trade: any)
 	}
 end
 
-function coordinator:_ops()
+function coordinator:_ops(fence: any)
 	return {
 		create = function(transaction)
 			return self.transaction_repository:create(transaction)
 		end,
+		get_consistent = function(transaction_id)
+			return self.transaction_repository:get_consistent(transaction_id)
+		end,
+		matches_fence = function(transaction)
+			return same_fence(transaction, fence) and transaction.coordinator.expires_at > os.time()
+		end,
+		renew = function(transaction_id)
+			return self.transaction_repository:renew(transaction_id, fence)
+		end,
 		prepare = function(user_id, transaction)
 			local session = self.sessions[user_id]
-			if session == nil then
+			if not usable_session(session) then
 				return false, "participant_unavailable"
 			end
 			return self.inventory_repository:prepare(session, transaction)
 		end,
 		rollback = function(user_id, transaction_id)
 			local session = self.sessions[user_id]
-			return self.inventory_repository:rollback_user(user_id, transaction_id, session and session.active and session or nil)
+			return self.inventory_repository:rollback_user(
+				user_id,
+				transaction_id,
+				recovery_session(session) and session or nil
+			)
 		end,
 		apply = function(user_id, transaction)
 			local session = self.sessions[user_id]
-			return self.inventory_repository:apply_transaction(transaction, user_id, session and session.active and session or nil)
+			return self.inventory_repository:apply_transaction(
+				transaction,
+				user_id,
+				recovery_session(session) and session or nil
+			)
 		end,
-		transition = function(transaction_id, allowed_from, next_state)
-			return self.transaction_repository:transition(transaction_id, allowed_from, next_state)
+		finalize = function(user_id, transaction_id)
+			local session = self.sessions[user_id]
+			return self.inventory_repository:finalize_user(
+				user_id,
+				transaction_id,
+				recovery_session(session) and session or nil
+			)
 		end,
-		mark_progress = function(transaction_id, section, user_id, value)
-			return self.transaction_repository:mark_progress(transaction_id, section, user_id, value)
+		transition = function(transaction_id, next_state)
+			return self.transaction_repository:transition(transaction_id, fence, next_state)
+		end,
+		mark_progress = function(transaction_id, section, user_id)
+			return self.transaction_repository:mark_progress(transaction_id, fence, section, user_id)
+		end,
+		unindex = function(transaction_id)
+			return self.transaction_repository:unindex(transaction_id)
 		end,
 	}
 end
 
 function coordinator:commit(trade: any)
+	if not self.running then
+		return false, "service_stopping"
+	end
 	local transaction, build_error = self:build_transaction(trade)
 	if transaction == nil then
 		return false, build_error
 	end
 
+	self.active_transactions[transaction.id] = true
 	self.observability.metrics.commits_started += 1
-	local ok, result = protocol.execute(transaction, self:_ops())
+	local packed = table.pack(xpcall(function()
+		return protocol.execute(transaction, self:_ops(transaction.coordinator))
+	end, debug.traceback))
+	self.active_transactions[transaction.id] = nil
+	local protocol_error = nil
+	if not packed[1] then
+		protocol_error = packed[2]
+		warn(string.format("[trading/error] transaction=%s error=%s", transaction.id, tostring(protocol_error)))
+	end
+	local ok = packed[1] and packed[2] == true
+	local result = packed[1] and packed[3] or "protocol_error"
 	if ok then
 		self.observability.metrics.commits_completed += 1
 		pcall(messaging_service.PublishAsync, messaging_service, config.recovery_topic, {
@@ -114,39 +193,86 @@ function coordinator:commit(trade: any)
 		transaction_id = transaction.id,
 		error = tostring(result),
 	}, "commit:" .. transaction.id)
-	self:start_recovery(transaction.id)
+	self:start_recovery(transaction.id, transaction.coordinator)
 	return false, result
 end
 
-function coordinator:recover_once(transaction_id: string)
-	local transaction, read_error = self.transaction_repository:get(transaction_id)
+function coordinator:recover_once(transaction_id: string, preferred_fence: any?, claim_token: string?)
+	local transaction, read_error = self.transaction_repository:get_consistent(transaction_id)
 	if transaction == nil then
+		if read_error == "not_found" then
+			self.transaction_repository:unindex(transaction_id)
+			return true, { state = "missing", id = transaction_id }
+		end
 		return false, read_error
 	end
+
+	local fence = preferred_fence
+	if transaction.state ~= "completed" and transaction.state ~= "aborted" then
+		if not same_fence(transaction, fence) then
+			local token = claim_token or utility.new_id("coord_")
+			local claimed, claim_error = self.transaction_repository:claim(transaction_id, self.server_id, token)
+			if claimed == nil then
+				return false, claim_error
+			end
+			transaction = claimed
+			fence = utility.deep_copy(claimed.coordinator)
+		else
+			local renewed, renew_error = self.transaction_repository:renew(transaction_id, fence)
+			if renewed == nil then
+				return false, renew_error
+			end
+			transaction = renewed
+		end
+	else
+		fence = utility.deep_copy(transaction.coordinator)
+	end
+
 	self.transaction_repository:note_recovery(transaction_id)
-	local ok, result = protocol.recover(transaction, self:_ops())
+	local ok, result = protocol.recover(transaction, self:_ops(fence))
 	if ok then
 		self.observability.metrics.commits_recovered += 1
+	else
+		self.transaction_repository:note_recovery(transaction_id, tostring(result))
 	end
 	return ok, result
 end
 
-function coordinator:start_recovery(transaction_id: string)
-	if self.recovery_workers[transaction_id] then
-		return
+function coordinator:start_recovery(transaction_id: string, preferred_fence: any?)
+	if
+		not self.running
+		or self.recovery_workers[transaction_id] ~= nil
+		or self.active_transactions[transaction_id] ~= nil
+		or self.recovery_worker_count >= config.maximum_recovery_workers
+	then
+		return false
 	end
 	self.recovery_workers[transaction_id] = true
+	self.recovery_worker_count += 1
 	task.spawn(function()
-		for attempt = 1, config.write_attempts do
-			local ok, result = self:recover_once(transaction_id)
-			if ok then
-				break
+		local recovery_token = utility.new_id("coord_")
+		local packed = table.pack(xpcall(function()
+			for attempt = 1, config.write_attempts do
+				if not self.running then
+					break
+				end
+				local ok = self:recover_once(transaction_id, preferred_fence, recovery_token)
+				if ok then
+					break
+				end
+				task.wait(math.min(8, attempt * 1.5))
 			end
-			self.transaction_repository:note_recovery(transaction_id, tostring(result))
-			task.wait(math.min(8, attempt * 1.5))
-		end
+		end, debug.traceback))
 		self.recovery_workers[transaction_id] = nil
+		self.recovery_worker_count = math.max(0, self.recovery_worker_count - 1)
+		if not packed[1] then
+			warn(string.format("[trading/error] recovery=%s error=%s", transaction_id, tostring(packed[2])))
+			self.observability:emit_alert("recovery_worker_failed", "critical", {
+				transaction_id = transaction_id,
+			}, "recovery_worker:" .. transaction_id)
+		end
 	end)
+	return true
 end
 
 function coordinator:sweep()
@@ -156,12 +282,23 @@ function coordinator:sweep()
 	end
 	local started = 0
 	for _, entry in ipairs(entries) do
+		if
+			started >= config.maximum_recoveries_per_sweep
+			or self.recovery_worker_count >= config.maximum_recovery_workers
+		then
+			break
+		end
 		if os.time() - entry.timestamp >= config.transaction_recovery_age_seconds then
-			self:start_recovery(entry.id)
-			started += 1
+			if self:start_recovery(entry.id) then
+				started += 1
+			end
 		end
 	end
 	return true, started
+end
+
+function coordinator:stop()
+	self.running = false
 end
 
 return coordinator

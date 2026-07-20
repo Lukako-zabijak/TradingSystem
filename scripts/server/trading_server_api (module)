@@ -36,6 +36,7 @@ function server_api:_inspect_inventory(value: any)
 		active = session.active,
 		revision = session.record.revision,
 		pending_transaction = session.record.pending_transaction,
+		pending_mutation = session.record.pending_mutation,
 		lease_owner = session.record.lease.owner,
 		lease_expires_at = session.record.lease.expires_at,
 	}
@@ -49,11 +50,11 @@ function server_api:_handle(action: any, ...: any)
 	if action == "get_inventory" then
 		return self.trading_service:get_inventory(arguments[1])
 	elseif action == "grant_item" then
-		return self.trading_service:grant_item(arguments[1], arguments[2])
+		return self.trading_service:grant_item(arguments[1], arguments[2], arguments[3])
 	elseif action == "revoke_item" then
-		return self.trading_service:revoke_item(arguments[1], arguments[2])
+		return self.trading_service:revoke_item(arguments[1], arguments[2], arguments[3])
 	elseif action == "set_trading_enabled" then
-		return self.trading_service:set_trading_enabled(arguments[1], arguments[2])
+		return self.trading_service:set_trading_enabled(arguments[1], arguments[2], arguments[3])
 	elseif action == "cancel_trade" then
 		return self.trading_service:cancel_trade(arguments[1], arguments[2])
 	elseif action == "inspect_transaction" then
@@ -61,7 +62,16 @@ function server_api:_handle(action: any, ...: any)
 			return false, "invalid_transaction_id"
 		end
 		local transaction, read_error = self.transaction_repository:get(arguments[1])
-		return transaction ~= nil, transaction or read_error
+		if transaction == nil then
+			return false, read_error
+		end
+		local inspection = utility.deep_copy(transaction)
+		inspection.coordinator = {
+			owner = transaction.coordinator.owner,
+			epoch = transaction.coordinator.epoch,
+			expires_at = transaction.coordinator.expires_at,
+		}
+		return true, inspection
 	elseif action == "inspect_inventory" then
 		return self:_inspect_inventory(arguments[1])
 	elseif action == "get_durable_alerts" then
@@ -72,8 +82,18 @@ function server_api:_handle(action: any, ...: any)
 		return self.coordinator:sweep()
 	elseif action == "reconcile_inventory" then
 		local ok, inventory_or_error = self.trading_service:get_inventory(arguments[1])
-		if not ok or inventory_or_error.pending_transaction == nil then
-			return false, ok and "no_reconciliation" or inventory_or_error
+		if not ok then
+			return false, inventory_or_error
+		end
+		if inventory_or_error.pending_mutation ~= nil then
+			local session = self.trading_service:get_session(inventory_or_error.user_id)
+			if session == nil then
+				return false, "not_loaded"
+			end
+			return self.trading_service.inventory_repository:recover_mutation(session)
+		end
+		if inventory_or_error.pending_transaction == nil then
+			return false, "no_reconciliation"
 		end
 		self.coordinator:start_recovery(inventory_or_error.pending_transaction)
 		return true, "recovery_started"
@@ -91,6 +111,7 @@ function server_api:_handle(action: any, ...: any)
 		return true, {
 			inventory_current = config.inventory_schema_version,
 			inventory_supported_from = 1,
+			mutation_current = config.mutation_schema_version,
 			transaction_current = config.transaction_schema_version,
 			transaction_supported_from = 1,
 		}

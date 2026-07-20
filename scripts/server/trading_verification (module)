@@ -2,16 +2,21 @@
 
 local config = require(script.Parent.Parent.shared:WaitForChild("trading_config (module)"))
 local protocol = require(script.Parent:WaitForChild("trade_protocol (module)"))
+local transfer_rules = require(script.Parent:WaitForChild("trade_transfer_rules (module)"))
 local schema = require(script.Parent.Parent.shared:WaitForChild("trading_schema (module)"))
 
 local verification = {}
 
-verification.last_report = {
+verification.last_report = ({
 	passed = false,
 	passed_count = 0,
 	failed_count = 0,
 	tests = {},
-}
+} :: any)
+
+local transaction_id = "trade_00000000000000000000000000000000"
+local left_user_id = 1001
+local right_user_id = 1002
 
 local function expect(condition: boolean, message: string)
 	if not condition then
@@ -19,143 +24,679 @@ local function expect(condition: boolean, message: string)
 	end
 end
 
-local function new_transaction()
+local function expect_equal(actual: any, expected: any, message: string)
+	if actual ~= expected then
+		error(string.format("%s; expected=%s actual=%s", message, tostring(expected), tostring(actual)), 2)
+	end
+end
+
+local function new_item(item_id: string)
+	return {
+		id = item_id,
+		kind = "verification_item",
+		name = "verification item",
+		tradable = true,
+		metadata = {},
+		created_at = 1,
+	}
+end
+
+local function new_transaction(options: any?): any
+	local values = options or {}
+	local state = values.state or "preparing"
+	local left_outgoing = values.left_outgoing
+	local right_outgoing = values.right_outgoing
+	if left_outgoing == nil then
+		left_outgoing = { new_item("item_00000000000000000000000000000001") }
+	end
+	if right_outgoing == nil then
+		right_outgoing = { new_item("item_00000000000000000000000000000002") }
+	end
+
+	local updated_at = 1
+	local terminal_at: number? = nil
+	if state == "completed" or state == "aborted" then
+		updated_at = 2
+		terminal_at = 2
+	end
+
 	return {
 		schema_version = config.transaction_schema_version,
 		protocol_revision = config.protocol_revision,
-		id = "trade_00000000000000000000000000000000",
-		state = "prepared",
-		users = { 1001, 1002 },
+		id = transaction_id,
+		state = state,
+		users = { left_user_id, right_user_id },
 		outgoing = {
-			["1001"] = {},
-			["1002"] = {},
+			[tostring(left_user_id)] = left_outgoing,
+			[tostring(right_user_id)] = right_outgoing,
 		},
 		created_at = 1,
-		updated_at = 1,
-		server_id = "test",
+		updated_at = updated_at,
+		server_id = "verification_server",
+		coordinator = {
+			owner = "verification_server",
+			token = "coordinator_test_token_0001",
+			epoch = 1,
+			expires_at = 600,
+		},
 		progress = {
 			prepared = {},
 			applied = {},
 			recovery_count = 0,
 			last_error = "",
 		},
+		terminal_at = terminal_at,
 	}
 end
 
-local function new_protocol_model(fail_prepare_user_id: number?)
-	local transaction = new_transaction()
-	local model = {
-		transaction = transaction,
-		prepared = {},
-		applied = {},
-		rolled_back = {},
+local function append_call(model: any, name: string)
+	table.insert(model.calls, name)
+end
+
+local function increment(map: { [string]: number }, key: string)
+	map[key] = (map[key] or 0) + 1
+end
+
+local function count_for(map: { [string]: number }, key: string): number
+	return map[key] or 0
+end
+
+local function transition_allowed(current_state: string, next_state: string): boolean
+	if current_state == next_state then
+		return true
+	end
+	if current_state == "preparing" then
+		return next_state == "aborting" or next_state == "committing"
+	elseif current_state == "aborting" then
+		return next_state == "aborted"
+	elseif current_state == "committing" then
+		return next_state == "completed"
+	end
+	return false
+end
+
+local function new_protocol_model(options: any?)
+	local settings = options or {}
+	local model: any = {
+		transaction = settings.transaction or new_transaction(),
+		calls = {},
+		prepare_calls = {},
+		rollback_calls = {},
+		apply_calls = {},
+		finalize_calls = {},
+		application_effects = {},
+		application_effect_counts = {},
+		consistent_reads = 0,
+		renewals = 0,
+		unindex_calls = 0,
 	}
-	local ops = {
-		create = function(candidate)
-			model.transaction = candidate
-			return true, candidate
-		end,
-		prepare = function(user_id)
-			if user_id == fail_prepare_user_id then
-				return false, "injected_prepare_failure"
-			end
-			model.prepared[tostring(user_id)] = true
-			return true
-		end,
-		rollback = function(user_id)
-			model.rolled_back[tostring(user_id)] = true
-			return true
-		end,
-		apply = function(user_id)
-			model.applied[tostring(user_id)] = true
-			return true
-		end,
-		mark_progress = function(_, section, user_id, value)
-			model.transaction.progress[section][tostring(user_id)] = value
-			return true
-		end,
-		transition = function(_, allowed_from, next_state)
-			if not allowed_from[model.transaction.state] and model.transaction.state ~= next_state then
-				return nil, "invalid_transition"
-			end
-			model.transaction.state = next_state
-			return model.transaction
-		end,
-	}
+	for _, user_id in ipairs(settings.initially_applied_user_ids or {}) do
+		local key = tostring(user_id)
+		model.application_effects[key] = true
+		model.application_effect_counts[key] = 1
+	end
+
+	local ops: any = {}
+
+	function ops.create(candidate: any)
+		append_call(model, "create")
+		model.transaction = candidate
+		return true, model.transaction
+	end
+
+	function ops.renew(_: string): (any?, string?)
+		append_call(model, "renew")
+		model.renewals += 1
+		if settings.renew_failure then
+			return nil, "injected_renew_failure"
+		end
+		return model.transaction, nil
+	end
+
+	function ops.get_consistent(_: string): (any?, string?)
+		append_call(model, "get_consistent")
+		model.consistent_reads += 1
+		if settings.consistent_read_unknown then
+			return nil, "injected_consistent_read_failure"
+		end
+		return model.transaction, nil
+	end
+
+	function ops.matches_fence(_: any): boolean
+		return settings.fence_lost ~= true
+	end
+
+	function ops.prepare(user_id: number, _: any): (boolean, string?)
+		local key = tostring(user_id)
+		append_call(model, "prepare:" .. key)
+		increment(model.prepare_calls, key)
+		if settings.fail_prepare_user_id == user_id then
+			return false, "injected_prepare_failure"
+		end
+		return true, nil
+	end
+
+	function ops.rollback(user_id: number, _: string): (boolean, string?)
+		local key = tostring(user_id)
+		append_call(model, "rollback:" .. key)
+		increment(model.rollback_calls, key)
+		return true, nil
+	end
+
+	function ops.apply(user_id: number, _: any): (boolean, string?)
+		local key = tostring(user_id)
+		append_call(model, "apply:" .. key)
+		increment(model.apply_calls, key)
+		if settings.fail_apply_user_id == user_id then
+			return false, "injected_apply_failure"
+		end
+		if model.application_effects[key] ~= true then
+			model.application_effects[key] = true
+			model.application_effect_counts[key] = 1
+		end
+		return true, nil
+	end
+
+	function ops.finalize(user_id: number, _: string): (boolean, string?)
+		local key = tostring(user_id)
+		append_call(model, "finalize:" .. key)
+		increment(model.finalize_calls, key)
+		return true, nil
+	end
+
+	function ops.transition(_: string, next_state: string): (any?, string?)
+		append_call(model, "transition:" .. next_state)
+		local current_state = model.transaction.state
+		if not transition_allowed(current_state, next_state) then
+			return nil, "invalid_transition"
+		end
+
+		if next_state == "committing" and settings.commit_decision_unknown then
+			return nil, "injected_commit_decision_failure"
+		end
+
+		model.transaction.state = next_state
+		model.transaction.updated_at += 1
+		if next_state == "completed" or next_state == "aborted" then
+			model.transaction.terminal_at = model.transaction.updated_at
+		end
+
+		if next_state == "committing" and settings.commit_acknowledgement_ambiguous then
+			return nil, "injected_ambiguous_commit_acknowledgement"
+		end
+		return model.transaction
+	end
+
+	function ops.mark_progress(_: string, section: string, user_id: number)
+		local key = tostring(user_id)
+		append_call(model, "progress:" .. section .. ":" .. key)
+		model.transaction.progress[section][key] = true
+		return true
+	end
+
+	function ops.unindex(_: string)
+		append_call(model, "unindex")
+		model.unindex_calls += 1
+		return true
+	end
+
 	return model, ops
 end
 
-local function execute_completes()
-	local model, ops = new_protocol_model(nil)
-	local ok = protocol.execute(model.transaction, ops)
-	expect(ok, "valid transaction did not complete")
-	expect(model.transaction.state == "completed", "transaction did not reach completed")
-	expect(model.applied["1001"] and model.applied["1002"], "both inventories were not applied")
+local function expect_no_calls(map: { [string]: number }, message: string)
+	for _, count in pairs(map) do
+		if count > 0 then
+			error(message, 2)
+		end
+	end
 end
 
-local function prepare_failure_aborts()
-	local model, ops = new_protocol_model(1002)
+local function protocol_execute_completes_and_finalizes()
+	local model, ops = new_protocol_model()
+	local ok, result = protocol.execute(model.transaction, ops)
+	expect(ok, tostring(result))
+	expect_equal(model.transaction.state, "completed", "successful execution did not complete")
+	expect_equal(count_for(model.prepare_calls, tostring(left_user_id)), 1, "left side was not prepared once")
+	expect_equal(count_for(model.prepare_calls, tostring(right_user_id)), 1, "right side was not prepared once")
+	expect_equal(count_for(model.apply_calls, tostring(left_user_id)), 1, "left side was not applied once")
+	expect_equal(count_for(model.apply_calls, tostring(right_user_id)), 1, "right side was not applied once")
+	expect_equal(count_for(model.finalize_calls, tostring(left_user_id)), 1, "left side was not finalized once")
+	expect_equal(count_for(model.finalize_calls, tostring(right_user_id)), 1, "right side was not finalized once")
+	expect_equal(model.unindex_calls, 1, "completed transaction was not unindexed")
+	expect_no_calls(model.rollback_calls, "successful transaction rolled back an inventory")
+end
+
+local function protocol_prepare_failure_decides_abort_before_rollback()
+	local model, ops = new_protocol_model({ fail_prepare_user_id = right_user_id })
 	local ok = protocol.execute(model.transaction, ops)
 	expect(not ok, "injected prepare failure unexpectedly completed")
-	expect(model.transaction.state == "aborted", "prepare failure did not abort")
-	expect(model.rolled_back["1001"] == true, "prepared participant was not rolled back")
-	expect(model.applied["1001"] == nil and model.applied["1002"] == nil, "aborted transaction applied inventory")
+	expect_equal(model.transaction.state, "aborted", "prepare failure did not reach aborted")
+
+	local abort_decided = false
+	for _, call_name in ipairs(model.calls) do
+		if call_name == "transition:aborting" then
+			abort_decided = true
+		elseif string.sub(call_name, 1, 9) == "rollback:" then
+			expect(abort_decided, "rollback ran before the durable abort decision")
+		end
+	end
+	expect(abort_decided, "prepare failure did not record an abort decision")
+	expect_equal(count_for(model.rollback_calls, tostring(left_user_id)), 1, "left side was not rolled back")
+	expect_equal(count_for(model.rollback_calls, tostring(right_user_id)), 1, "right side was not rolled back idempotently")
+	expect_no_calls(model.apply_calls, "aborted transaction applied an inventory")
+	expect_equal(model.unindex_calls, 1, "aborted transaction was not unindexed")
 end
 
-local function recovery_finishes_committing()
-	local model, ops = new_protocol_model(nil)
-	model.transaction.state = "committing"
-	model.transaction.progress.prepared["1001"] = true
-	model.transaction.progress.prepared["1002"] = true
-	model.transaction.progress.applied["1001"] = true
-	local ok = protocol.recover(model.transaction, ops)
-	expect(ok, "committing recovery failed")
-	expect(model.transaction.state == "completed", "recovery did not complete")
-	expect(model.applied["1001"] == nil, "already-applied side ran twice")
-	expect(model.applied["1002"] == true, "missing side was not applied")
+local function protocol_ambiguous_commit_readback_rolls_forward()
+	local model, ops = new_protocol_model({ commit_acknowledgement_ambiguous = true })
+	local ok, result = protocol.execute(model.transaction, ops)
+	expect(ok, tostring(result))
+	expect_equal(model.consistent_reads, 1, "ambiguous commit was not resolved by a consistent read")
+	expect_equal(model.transaction.state, "completed", "acknowledged commit did not roll forward")
+	expect_equal(count_for(model.apply_calls, tostring(left_user_id)), 1, "left side did not roll forward")
+	expect_equal(count_for(model.apply_calls, tostring(right_user_id)), 1, "right side did not roll forward")
+	expect_no_calls(model.rollback_calls, "acknowledged commit was rolled back")
 end
 
-local function request_contract_rejects_unknown_fields()
-	local request = {
-		version = 1,
-		session = "bootstrap_session",
-		sequence = 0,
-		request_id = "request_00000000",
-		action = "bootstrap",
-		payload = { exploit = true },
+local function protocol_unknown_commit_decision_never_rolls_back()
+	local model, ops = new_protocol_model({
+		commit_decision_unknown = true,
+		consistent_read_unknown = true,
+	})
+	local ok, result = protocol.execute(model.transaction, ops)
+	expect(not ok, "unknown commit decision unexpectedly completed")
+	expect_equal(result, "injected_consistent_read_failure", "unknown decision returned the wrong failure")
+	expect_equal(model.transaction.state, "preparing", "unknown decision changed transaction state")
+	expect_equal(model.consistent_reads, 1, "unknown decision was not checked consistently")
+	expect_no_calls(model.rollback_calls, "unknown commit decision triggered rollback")
+	expect_no_calls(model.apply_calls, "unknown commit decision applied inventory")
+	expect_equal(model.unindex_calls, 0, "unknown transaction was removed from recovery discovery")
+end
+
+local function protocol_recover_preparing_aborts()
+	local transaction = new_transaction({ state = "preparing" })
+	transaction.progress.prepared[tostring(left_user_id)] = true
+	local model, ops = new_protocol_model({ transaction = transaction })
+	local ok, result = protocol.recover(model.transaction, ops)
+	expect(ok, tostring(result))
+	expect_equal(model.transaction.state, "aborted", "preparing recovery did not abort")
+	expect_equal(count_for(model.rollback_calls, tostring(left_user_id)), 1, "prepared side was not rolled back")
+	expect_equal(count_for(model.rollback_calls, tostring(right_user_id)), 1, "unprepared side was not reconciled idempotently")
+	expect_no_calls(model.apply_calls, "preparing recovery applied inventory")
+end
+
+local function protocol_recover_committing_reapplies_idempotently()
+	local transaction = new_transaction({ state = "committing" })
+	transaction.progress.applied[tostring(left_user_id)] = true
+	transaction.progress.applied[tostring(right_user_id)] = true
+	local model, ops = new_protocol_model({
+		transaction = transaction,
+		initially_applied_user_ids = { left_user_id },
+	})
+	local ok, result = protocol.recover(model.transaction, ops)
+	expect(ok, tostring(result))
+	expect_equal(model.transaction.state, "completed", "committing recovery did not complete")
+	expect_equal(count_for(model.apply_calls, tostring(left_user_id)), 1, "left receipt was not rechecked")
+	expect_equal(count_for(model.apply_calls, tostring(right_user_id)), 1, "right receipt was not rechecked")
+	expect(model.application_effects[tostring(left_user_id)] == true, "left idempotent effect was lost")
+	expect(model.application_effects[tostring(right_user_id)] == true, "right effect was not applied")
+	expect_equal(
+		model.application_effect_counts[tostring(left_user_id)],
+		1,
+		"left idempotent apply duplicated its effect"
+	)
+	expect_equal(
+		model.application_effect_counts[tostring(right_user_id)],
+		1,
+		"right apply produced the wrong effect count"
+	)
+	expect_no_calls(model.rollback_calls, "committing recovery attempted rollback")
+end
+
+local function protocol_recover_completed_finalizes()
+	local transaction = new_transaction({ state = "completed" })
+	local model, ops = new_protocol_model({ transaction = transaction })
+	local ok, result = protocol.recover(model.transaction, ops)
+	expect(ok, tostring(result))
+	expect_equal(count_for(model.finalize_calls, tostring(left_user_id)), 1, "left completed side was not finalized")
+	expect_equal(count_for(model.finalize_calls, tostring(right_user_id)), 1, "right completed side was not finalized")
+	expect_no_calls(model.apply_calls, "completed recovery reapplied inventory")
+	expect_no_calls(model.rollback_calls, "completed recovery rolled back inventory")
+	expect_equal(model.unindex_calls, 1, "completed recovery did not unindex")
+end
+
+local function protocol_apply_failure_stays_committing()
+	local model, ops = new_protocol_model({ fail_apply_user_id = right_user_id })
+	local ok, result = protocol.execute(model.transaction, ops)
+	expect(not ok, "injected apply failure unexpectedly completed")
+	expect_equal(result, "injected_apply_failure", "apply failure returned the wrong error")
+	expect_equal(model.transaction.state, "committing", "apply failure lost the commit decision")
+	expect_equal(count_for(model.apply_calls, tostring(left_user_id)), 1, "left apply did not run")
+	expect_equal(count_for(model.apply_calls, tostring(right_user_id)), 1, "right apply was not attempted")
+	expect_no_calls(model.rollback_calls, "committing transaction rolled back after apply failure")
+	expect_no_calls(model.finalize_calls, "incomplete commit was finalized")
+	expect_equal(model.unindex_calls, 0, "incomplete commit was removed from recovery discovery")
+end
+
+local function protocol_fence_loss_stops_before_participant_effects()
+	local model, ops = new_protocol_model({ renew_failure = true, fence_lost = true })
+	local ok, result = protocol.execute(model.transaction, ops)
+	expect(not ok, "fenced coordinator unexpectedly continued")
+	expect_equal(result, "coordinator_fenced", "fence loss returned the wrong error")
+	expect_no_calls(model.prepare_calls, "fenced coordinator prepared an inventory")
+	expect_no_calls(model.apply_calls, "fenced coordinator applied an inventory")
+	expect_no_calls(model.rollback_calls, "fenced coordinator rolled back an inventory")
+end
+
+local function transaction_schema_accepts_valid_transaction()
+	local transaction = new_transaction()
+	local normalized, reason = schema.normalize_transaction(transaction, transaction.id)
+	expect(normalized ~= nil, reason or "valid transaction was rejected")
+	expect_equal(normalized.state, "preparing", "valid transaction state changed")
+	expect_equal(#normalized.outgoing[tostring(left_user_id)], 1, "left items were not retained")
+	expect_equal(#normalized.outgoing[tostring(right_user_id)], 1, "right items were not retained")
+end
+
+local function transaction_schema_rejects_empty_transaction()
+	local transaction = new_transaction({ left_outgoing = {}, right_outgoing = {} })
+	local normalized, reason = schema.normalize_transaction(transaction, transaction.id)
+	expect(normalized == nil, "empty transaction was accepted")
+	expect_equal(reason, "empty_transaction", "empty transaction returned the wrong error")
+end
+
+local function transaction_schema_rejects_duplicate_item_ids()
+	local duplicate = new_item("item_00000000000000000000000000000003")
+	local transaction = new_transaction({
+		left_outgoing = { duplicate },
+		right_outgoing = { duplicate },
+	})
+	local normalized, reason = schema.normalize_transaction(transaction, transaction.id)
+	expect(normalized == nil, "cross-participant duplicate item was accepted")
+	expect_equal(reason, "duplicate_transaction_item", "duplicate transaction returned the wrong error")
+end
+
+local function transaction_schema_migrates_partial_legacy_commit()
+	local legacy = new_transaction({ state = "committing" })
+	legacy.schema_version = 2
+	legacy.protocol_revision = 1
+	legacy.coordinator = nil
+	legacy.progress.applied[tostring(left_user_id)] = true
+	local normalized, reason = schema.normalize_transaction(legacy, legacy.id)
+	expect(normalized ~= nil, reason or "legacy committing transaction was rejected")
+	local model, ops = new_protocol_model({
+		transaction = normalized,
+		initially_applied_user_ids = { left_user_id },
+	})
+	local ok, result = protocol.recover(model.transaction, ops)
+	expect(ok, tostring(result))
+	expect_equal(model.transaction.state, "completed", "legacy partial commit did not roll forward")
+	expect_equal(model.application_effect_counts[tostring(left_user_id)], 1, "legacy applied side duplicated")
+	expect_equal(model.application_effect_counts[tostring(right_user_id)], 1, "legacy missing side was not applied")
+	expect_no_calls(model.rollback_calls, "legacy committing transaction rolled back")
+end
+
+local function mutation_schema_accepts_durable_operation()
+	local mutation_id = "mut_00000000000000000000000000000000"
+	local item = new_item("item_00000000000000000000000000000004")
+	local operation = {
+		schema_version = config.mutation_schema_version,
+		id = mutation_id,
+		user_id = left_user_id,
+		kind = "grant_item",
+		payload = { item = item, generated_created_at = true },
+		result = item.id,
+		status = "started",
+		created_at = 10,
+		updated_at = 10,
 	}
-	local normalized = schema.validate_request(request)
-	expect(normalized == nil, "unknown payload field was accepted")
+	local normalized, reason = schema.normalize_mutation_operation(operation, mutation_id)
+	expect(normalized ~= nil, reason or "valid mutation operation was rejected")
+	expect_equal(normalized.result, item.id, "mutation result changed")
+	local retry_item = new_item(item.id)
+	retry_item.created_at = item.created_at + 1
+	local retry = {
+		schema_version = config.mutation_schema_version,
+		id = mutation_id,
+		user_id = left_user_id,
+		kind = "grant_item",
+		payload = { item = retry_item, generated_created_at = true },
+		result = retry_item.id,
+		status = "started",
+		created_at = 11,
+		updated_at = 11,
+	}
+	expect(
+		schema.mutation_operations_match(operation, retry),
+		"generated grant timestamp made an exact retry conflict"
+	)
+	retry.payload.item.name = "different item"
+	expect(not schema.mutation_operations_match(operation, retry), "different mutation payload was accepted")
 end
 
-local function request_contract_normalizes_offer()
-	local request = {
-		version = 1,
+local function inventory_schema_rejects_conflicting_pending_operations()
+	local record = schema.new_inventory_record(left_user_id)
+	record.pending_transaction = transaction_id
+	record.pending_mutation = "mut_00000000000000000000000000000000"
+	local normalized, reason = schema.normalize_inventory(record, left_user_id)
+	expect(normalized == nil, "conflicting pending operations were accepted")
+	expect_equal(reason, "conflicting_pending_operations", "pending conflict returned the wrong error")
+end
+
+local function new_inventory_record(item_count: number)
+	local record: any = { items = {} }
+	for index = 1, item_count do
+		local item = new_item(string.format("owned_%04d", index))
+		record.items[item.id] = item
+	end
+	return record
+end
+
+local function transfer_allows_growth_from_499_to_500()
+	local incoming = new_item("item_incoming_capacity_boundary")
+	local transaction = new_transaction({ left_outgoing = {}, right_outgoing = { incoming } })
+	local record = new_inventory_record(config.maximum_inventory_items - 1)
+	local ok, reason, _, _, projected_count = transfer_rules.validate(record, transaction, left_user_id)
+	expect(ok, reason or "valid boundary transfer was rejected")
+	expect_equal(projected_count, config.maximum_inventory_items, "boundary projection was incorrect")
+end
+
+local function transfer_allows_replacement_at_500()
+	local record = new_inventory_record(config.maximum_inventory_items)
+	local outgoing = record.items["owned_0001"]
+	local incoming = new_item("item_incoming_replacement_boundary")
+	local transaction = new_transaction({ left_outgoing = { outgoing }, right_outgoing = { incoming } })
+	local ok, reason, _, _, projected_count = transfer_rules.validate(record, transaction, left_user_id)
+	expect(ok, reason or "capacity-neutral replacement was rejected")
+	expect_equal(projected_count, config.maximum_inventory_items, "replacement projection was incorrect")
+end
+
+local function transfer_rejects_growth_beyond_500()
+	local incoming = new_item("item_incoming_over_capacity")
+	local transaction = new_transaction({ left_outgoing = {}, right_outgoing = { incoming } })
+	local record = new_inventory_record(config.maximum_inventory_items)
+	local ok, reason = transfer_rules.validate(record, transaction, left_user_id)
+	expect(not ok, "over-capacity transfer was accepted")
+	expect_equal(reason, "inventory_capacity_exceeded", "over-capacity transfer returned the wrong error")
+end
+
+local function transfer_rejects_incoming_collision()
+	local incoming = new_item("item_incoming_collision")
+	local transaction = new_transaction({ left_outgoing = {}, right_outgoing = { incoming } })
+	local record = new_inventory_record(1)
+	record.items[incoming.id] = incoming
+	local ok, reason = transfer_rules.validate(record, transaction, left_user_id)
+	expect(not ok, "incoming item collision was accepted")
+	expect_equal(reason, "incoming_item_collision", "incoming collision returned the wrong error")
+end
+
+local function valid_offer_request(): any
+	return {
+		version = config.protocol_version,
 		session = "session_00000000000000000000000000000000",
 		sequence = 1,
 		request_id = "request_00000000",
 		action = "set_offer",
 		payload = {
-			trade_id = "trade_00000000000000000000000000000000",
+			trade_id = transaction_id,
 			expected_revision = 0,
-			item_ids = { "item_00000000000000000000000000000000", "item_00000000000000000000000000000001" },
+			item_ids = {
+				"item_00000000000000000000000000000002",
+				"item_00000000000000000000000000000001",
+			},
 		},
 	}
+end
+
+local function expect_request_rejected(request: any, expected_reason: string)
 	local normalized, reason = schema.validate_request(request)
-	expect(normalized ~= nil, reason or "valid offer rejected")
-	expect(normalized.payload.item_ids[1] < normalized.payload.item_ids[2], "offer ids were not deterministic")
+	expect(normalized == nil, "invalid request was accepted")
+	expect_equal(reason, expected_reason, "request returned the wrong validation error")
+end
+
+local function request_contract_accepts_and_sorts_offer()
+	local request = valid_offer_request()
+	local normalized, reason = schema.validate_request(request)
+	expect(normalized ~= nil, reason or "valid offer was rejected")
+	expect(
+		normalized.payload.item_ids[1] < normalized.payload.item_ids[2],
+		"normalized offer order was not deterministic"
+	)
+	expect(
+		request.payload.item_ids[1] > request.payload.item_ids[2],
+		"request validation mutated the caller's item array"
+	)
+end
+
+local function request_contract_rejects_unknown_fields()
+	local envelope = valid_offer_request()
+	envelope.exploit = true
+	expect_request_rejected(envelope, "invalid_envelope")
+
+	local payload = valid_offer_request()
+	payload.payload.exploit = true
+	expect_request_rejected(payload, "invalid_payload")
+end
+
+local function request_contract_rejects_unsafe_numbers()
+	local unsafe_sequence = valid_offer_request()
+	unsafe_sequence.sequence = math.huge
+	expect_request_rejected(unsafe_sequence, "invalid_sequence")
+
+	local unsafe_revision = valid_offer_request()
+	unsafe_revision.payload.expected_revision = 9007199254740992
+	expect_request_rejected(unsafe_revision, "invalid_offer")
+
+	local fractional_revision = valid_offer_request()
+	fractional_revision.payload.expected_revision = 0.5
+	expect_request_rejected(fractional_revision, "invalid_offer")
+end
+
+local function request_contract_rejects_malformed_item_arrays()
+	local duplicate = valid_offer_request()
+	duplicate.payload.item_ids[2] = duplicate.payload.item_ids[1]
+	expect_request_rejected(duplicate, "invalid_item_ids")
+
+	local sparse = valid_offer_request()
+	sparse.payload.item_ids = {
+		[1] = "item_00000000000000000000000000000001",
+		[3] = "item_00000000000000000000000000000002",
+	}
+	expect_request_rejected(sparse, "invalid_item_ids")
+
+	local keyed = valid_offer_request()
+	keyed.payload.item_ids = { item = "item_00000000000000000000000000000001" }
+	expect_request_rejected(keyed, "invalid_item_ids")
+end
+
+local function request_contract_enforces_bootstrap_shape()
+	local valid = {
+		version = config.protocol_version,
+		session = "bootstrap_session",
+		sequence = 0,
+		request_id = "request_00000000",
+		action = "bootstrap",
+		payload = {},
+	}
+	local normalized, reason = schema.validate_request(valid)
+	expect(normalized ~= nil, reason or "valid bootstrap was rejected")
+
+	local wrong_sequence = {
+		version = config.protocol_version,
+		session = "bootstrap_session",
+		sequence = 1,
+		request_id = "request_00000001",
+		action = "bootstrap",
+		payload = {},
+	}
+	expect_request_rejected(wrong_sequence, "invalid_bootstrap")
+
+	local unknown_action = {
+		version = config.protocol_version,
+		session = "bootstrap_session",
+		sequence = 0,
+		request_id = "request_00000002",
+		action = "admin_grant",
+		payload = {},
+	}
+	expect_request_rejected(unknown_action, "invalid_action")
 end
 
 local test_cases = {
-	{ name = "execute_completes", run = execute_completes },
-	{ name = "prepare_failure_aborts", run = prepare_failure_aborts },
-	{ name = "recovery_finishes_committing", run = recovery_finishes_committing },
+	{ name = "protocol_execute_completes_and_finalizes", run = protocol_execute_completes_and_finalizes },
+	{
+		name = "protocol_prepare_failure_decides_abort_before_rollback",
+		run = protocol_prepare_failure_decides_abort_before_rollback,
+	},
+	{
+		name = "protocol_ambiguous_commit_readback_rolls_forward",
+		run = protocol_ambiguous_commit_readback_rolls_forward,
+	},
+	{
+		name = "protocol_unknown_commit_decision_never_rolls_back",
+		run = protocol_unknown_commit_decision_never_rolls_back,
+	},
+	{ name = "protocol_recover_preparing_aborts", run = protocol_recover_preparing_aborts },
+	{
+		name = "protocol_recover_committing_reapplies_idempotently",
+		run = protocol_recover_committing_reapplies_idempotently,
+	},
+	{ name = "protocol_recover_completed_finalizes", run = protocol_recover_completed_finalizes },
+	{ name = "protocol_apply_failure_stays_committing", run = protocol_apply_failure_stays_committing },
+	{
+		name = "protocol_fence_loss_stops_before_participant_effects",
+		run = protocol_fence_loss_stops_before_participant_effects,
+	},
+	{ name = "transaction_schema_accepts_valid_transaction", run = transaction_schema_accepts_valid_transaction },
+	{ name = "transaction_schema_rejects_empty_transaction", run = transaction_schema_rejects_empty_transaction },
+	{
+		name = "transaction_schema_rejects_duplicate_item_ids",
+		run = transaction_schema_rejects_duplicate_item_ids,
+	},
+	{
+		name = "transaction_schema_migrates_partial_legacy_commit",
+		run = transaction_schema_migrates_partial_legacy_commit,
+	},
+	{ name = "mutation_schema_accepts_durable_operation", run = mutation_schema_accepts_durable_operation },
+	{
+		name = "inventory_schema_rejects_conflicting_pending_operations",
+		run = inventory_schema_rejects_conflicting_pending_operations,
+	},
+	{ name = "transfer_allows_growth_from_499_to_500", run = transfer_allows_growth_from_499_to_500 },
+	{ name = "transfer_allows_replacement_at_500", run = transfer_allows_replacement_at_500 },
+	{ name = "transfer_rejects_growth_beyond_500", run = transfer_rejects_growth_beyond_500 },
+	{ name = "transfer_rejects_incoming_collision", run = transfer_rejects_incoming_collision },
+	{ name = "request_contract_accepts_and_sorts_offer", run = request_contract_accepts_and_sorts_offer },
 	{ name = "request_contract_rejects_unknown_fields", run = request_contract_rejects_unknown_fields },
-	{ name = "request_contract_normalizes_offer", run = request_contract_normalizes_offer },
+	{ name = "request_contract_rejects_unsafe_numbers", run = request_contract_rejects_unsafe_numbers },
+	{
+		name = "request_contract_rejects_malformed_item_arrays",
+		run = request_contract_rejects_malformed_item_arrays,
+	},
+	{ name = "request_contract_enforces_bootstrap_shape", run = request_contract_enforces_bootstrap_shape },
 }
 
 function verification.run_all()
-	local report = {
+	local report: any = {
 		passed = true,
 		passed_count = 0,
 		failed_count = 0,
@@ -165,11 +706,17 @@ function verification.run_all()
 	}
 	for _, test_case in ipairs(test_cases) do
 		local started_at = os.clock()
-		local ok, test_error = xpcall(test_case.run, debug.traceback)
+		local ok, test_error = pcall(function()
+			test_case.run()
+		end)
+		local error_message: string? = nil
+		if not ok then
+			error_message = tostring(test_error)
+		end
 		table.insert(report.tests, {
 			name = test_case.name,
 			passed = ok,
-			error = ok and nil or tostring(test_error),
+			error = error_message,
 			duration_seconds = os.clock() - started_at,
 		})
 		if ok then
@@ -184,7 +731,7 @@ function verification.run_all()
 	return report.passed, report
 end
 
-function verification.run_lease_load_test(player_count: any, budget: any, duration_seconds: any)
+function verification.run_lease_load_test(player_count: any, budget: any, duration_seconds: any): (boolean, any)
 	if
 		type(player_count) ~= "number"
 		or player_count % 1 ~= 0
@@ -204,12 +751,13 @@ function verification.run_lease_load_test(player_count: any, budget: any, durati
 
 	local refreshes_per_player = math.ceil(duration_seconds / config.lease_refresh_seconds)
 	local required_updates = player_count * refreshes_per_player
-	local available_updates = budget * duration_seconds
+	local available_updates = math.floor(budget * duration_seconds / 60)
 	return true, {
 		players = player_count,
 		duration_seconds = duration_seconds,
 		required_updates = required_updates,
 		available_updates = available_updates,
+		updates_per_minute = budget,
 		budget_sufficient = available_updates >= required_updates,
 	}
 end

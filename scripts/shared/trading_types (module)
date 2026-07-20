@@ -22,9 +22,22 @@ export type inventory_record = {
 	items: { [string]: item },
 	settings: { trading_enabled: boolean },
 	pending_transaction: string?,
+	pending_mutation: string?,
 	receipts: { [string]: number },
 	mutation_receipts: { [string]: number },
 	lease: lease,
+	updated_at: number,
+}
+
+export type mutation_operation = {
+	schema_version: number,
+	id: string,
+	user_id: number,
+	kind: "grant_item" | "revoke_item" | "set_trading_enabled",
+	payload: any,
+	result: any,
+	status: "started" | "completed",
+	created_at: number,
 	updated_at: number,
 }
 
@@ -32,12 +45,18 @@ export type transaction = {
 	schema_version: number,
 	protocol_revision: number,
 	id: string,
-	state: "prepared" | "committing" | "completed" | "aborted",
+	state: "preparing" | "aborting" | "committing" | "completed" | "aborted",
 	users: { number },
 	outgoing: { [string]: { item } },
 	created_at: number,
 	updated_at: number,
 	server_id: string,
+	coordinator: {
+		owner: string,
+		token: string,
+		epoch: number,
+		expires_at: number,
+	},
 	progress: {
 		prepared: { [string]: boolean },
 		applied: { [string]: boolean },
@@ -63,6 +82,7 @@ export type player_session = {
 	last_sequence: number,
 	security_score: number,
 	security_updated_at: number,
+	destroyed: boolean,
 }
 
 return table.freeze({})

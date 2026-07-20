@@ -2,24 +2,137 @@
 
 local protocol = {}
 
-local prepared_state = table.freeze({ prepared = true })
-local committing_state = table.freeze({ prepared = true, committing = true })
+local function read_current(transaction_id: string, ops: any)
+	local current, read_error = ops.get_consistent(transaction_id)
+	if current == nil then
+		return nil, read_error or "decision_unknown"
+	end
+	return current, nil
+end
 
-local function rollback_prepared(transaction: any, ops: any, prepared_users: { number })
-	local rolled_back = true
-	local rollback_error = nil
-	for _, user_id in ipairs(prepared_users) do
-		local ok, current_error = ops.rollback(user_id, transaction.id)
-		if not ok then
-			rolled_back = false
-			rollback_error = current_error
+local function renew_or_resolve(transaction: any, ops: any): (any?, string?)
+	if transaction.state == "completed" or transaction.state == "aborted" then
+		return transaction, nil
+	end
+	local renewed, renew_error = ops.renew(transaction.id)
+	if renewed ~= nil then
+		return renewed, nil
+	end
+	local current, read_error = read_current(transaction.id, ops)
+	if current == nil then
+		return nil, read_error or renew_error
+	end
+	if current.state ~= "completed" and current.state ~= "aborted" and not ops.matches_fence(current) then
+		return nil, "coordinator_fenced"
+	end
+	return current, nil
+end
+
+local function drive_commit(transaction: any, ops: any)
+	if transaction.state == "completed" then
+		for _, user_id in ipairs(transaction.users) do
+			local finalized, finalize_error = ops.finalize(user_id, transaction.id)
+			if not finalized then
+				return false, finalize_error or "finalize_incomplete"
+			end
+		end
+		ops.unindex(transaction.id)
+		return true, transaction
+	end
+	if transaction.state ~= "committing" then
+		return false, "commit_not_decided"
+	end
+
+	for _, user_id in ipairs(transaction.users) do
+		local current, renew_error = renew_or_resolve(transaction, ops)
+		if current == nil then
+			return false, renew_error
+		end
+		if current.state == "completed" then
+			return drive_commit(current, ops)
+		end
+		if current.state ~= "committing" then
+			return false, "commit_state_changed"
+		end
+		transaction = current
+
+		local applied, apply_error = ops.apply(user_id, transaction)
+		if not applied then
+			return false, apply_error or "apply_incomplete"
 		end
 	end
-	if not rolled_back then
-		return false, rollback_error or "rollback_incomplete"
+
+	local completed, complete_error = ops.transition(transaction.id, "completed")
+	if completed ~= nil then
+		return drive_commit(completed, ops)
 	end
-	local aborted, abort_error = ops.transition(transaction.id, prepared_state, "aborted")
-	return aborted ~= nil, aborted or abort_error
+	local current, read_error = read_current(transaction.id, ops)
+	if current ~= nil and current.state == "completed" then
+		return drive_commit(current, ops)
+	end
+	return false, read_error or complete_error or "completion_unknown"
+end
+
+local function drive_abort(transaction: any, ops: any)
+	if transaction.state == "completed" or transaction.state == "committing" then
+		return drive_commit(transaction, ops)
+	end
+
+	if transaction.state == "preparing" then
+		local aborting, decision_error = ops.transition(transaction.id, "aborting")
+		if aborting == nil then
+			local current, read_error = read_current(transaction.id, ops)
+			if current == nil then
+				return false, read_error or decision_error or "abort_decision_unknown"
+			end
+			transaction = current
+		else
+			transaction = aborting
+		end
+	end
+
+	if transaction.state == "committing" or transaction.state == "completed" then
+		return drive_commit(transaction, ops)
+	end
+	if transaction.state ~= "aborting" and transaction.state ~= "aborted" then
+		return false, "invalid_abort_state"
+	end
+
+	for _, user_id in ipairs(transaction.users) do
+		if transaction.state == "aborting" then
+			local current, renew_error = renew_or_resolve(transaction, ops)
+			if current == nil then
+				return false, renew_error
+			end
+			if current.state == "committing" or current.state == "completed" then
+				return drive_commit(current, ops)
+			end
+			if current.state ~= "aborting" and current.state ~= "aborted" then
+				return false, "abort_state_changed"
+			end
+			transaction = current
+		end
+		local rolled_back, rollback_error = ops.rollback(user_id, transaction.id)
+		if not rolled_back then
+			return false, rollback_error or "rollback_incomplete"
+		end
+	end
+	if transaction.state == "aborted" then
+		ops.unindex(transaction.id)
+		return true, transaction
+	end
+
+	local aborted, complete_error = ops.transition(transaction.id, "aborted")
+	if aborted ~= nil then
+		ops.unindex(transaction.id)
+		return true, aborted
+	end
+	local current, read_error = read_current(transaction.id, ops)
+	if current ~= nil and current.state == "aborted" then
+		ops.unindex(transaction.id)
+		return true, current
+	end
+	return false, read_error or complete_error or "abort_completion_unknown"
 end
 
 function protocol.execute(transaction: any, ops: any)
@@ -29,88 +142,55 @@ function protocol.execute(transaction: any, ops: any)
 	end
 	transaction = create_result
 
-	local prepared_users = {}
 	for _, user_id in ipairs(transaction.users) do
+		local current, renew_error = renew_or_resolve(transaction, ops)
+		if current == nil then
+			return false, renew_error
+		end
+		if current.state ~= "preparing" then
+			return protocol.recover(current, ops)
+		end
+		transaction = current
+
 		local prepared, prepare_error = ops.prepare(user_id, transaction)
 		if not prepared then
-			rollback_prepared(transaction, ops, prepared_users)
-			return false, prepare_error
+			local resolved, outcome = drive_abort(transaction, ops)
+			if resolved and outcome.state == "completed" then
+				return true, outcome
+			end
+			return false, resolved and prepare_error or outcome
 		end
-		table.insert(prepared_users, user_id)
-		ops.mark_progress(transaction.id, "prepared", user_id, true)
 	end
 
-	local committing, transition_error = ops.transition(transaction.id, prepared_state, "committing")
+	local committing, decision_error = ops.transition(transaction.id, "committing")
 	if committing == nil then
-		rollback_prepared(transaction, ops, prepared_users)
-		return false, transition_error
-	end
-	transaction = committing
-
-	for _, user_id in ipairs(transaction.users) do
-		local applied, apply_error = ops.apply(user_id, transaction)
-		if not applied then
-			return false, apply_error
+		local current, read_error = read_current(transaction.id, ops)
+		if current == nil then
+			return false, read_error or decision_error or "commit_decision_unknown"
 		end
-		ops.mark_progress(transaction.id, "applied", user_id, true)
+		if current.state == "preparing" or current.state == "aborting" or current.state == "aborted" then
+			local resolved, outcome = drive_abort(current, ops)
+			if resolved and outcome.state == "completed" then
+				return true, outcome
+			end
+			return false, resolved and decision_error or outcome
+		end
+		committing = current
 	end
-
-	local completed, complete_error = ops.transition(transaction.id, committing_state, "completed")
-	if completed == nil then
-		return false, complete_error
-	end
-	return true, completed
+	return drive_commit(committing, ops)
 end
 
 function protocol.recover(transaction: any, ops: any)
-	if transaction.state == "completed" or transaction.state == "aborted" then
-		return true, transaction
+	if transaction.state == "completed" then
+		return drive_commit(transaction, ops)
 	end
-
-	if transaction.state == "prepared" then
-		local all_prepared = true
-		for _, user_id in ipairs(transaction.users) do
-			if transaction.progress.prepared[tostring(user_id)] ~= true then
-				all_prepared = false
-				break
-			end
-		end
-		if not all_prepared then
-			local rolled_back = true
-			local rollback_error = nil
-			for _, user_id in ipairs(transaction.users) do
-				local ok, current_error = ops.rollback(user_id, transaction.id)
-				if not ok then
-					rolled_back = false
-					rollback_error = current_error
-				end
-			end
-			if not rolled_back then
-				return false, rollback_error or "rollback_incomplete"
-			end
-			local aborted, abort_error = ops.transition(transaction.id, prepared_state, "aborted")
-			return aborted ~= nil, aborted or abort_error
-		end
-
-		local committing, transition_error = ops.transition(transaction.id, prepared_state, "committing")
-		if committing == nil then
-			return false, transition_error
-		end
-		transaction = committing
+	if transaction.state == "committing" then
+		return drive_commit(transaction, ops)
 	end
-
-	for _, user_id in ipairs(transaction.users) do
-		if transaction.progress.applied[tostring(user_id)] ~= true then
-			local applied, apply_error = ops.apply(user_id, transaction)
-			if not applied then
-				return false, apply_error
-			end
-			ops.mark_progress(transaction.id, "applied", user_id, true)
-		end
+	if transaction.state == "preparing" or transaction.state == "aborting" or transaction.state == "aborted" then
+		return drive_abort(transaction, ops)
 	end
-
-	local completed, complete_error = ops.transition(transaction.id, committing_state, "completed")
-	return completed ~= nil, completed or complete_error
+	return false, "invalid_recovery_state"
 end
 
 return table.freeze(protocol)

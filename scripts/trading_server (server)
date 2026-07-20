@@ -46,8 +46,9 @@ if server_id == "" then
 	server_id = utility.new_id("studio_")
 end
 
-script:SetAttribute("architecture_revision", 3)
+script:SetAttribute("architecture_revision", 5)
 script:SetAttribute("inventory_schema_version", config.inventory_schema_version)
+script:SetAttribute("mutation_schema_version", config.mutation_schema_version)
 script:SetAttribute("transaction_schema_version", config.transaction_schema_version)
 
 local gateway = gateway_module.new()
