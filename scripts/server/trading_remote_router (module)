@@ -128,6 +128,7 @@ function router:_on_request(player: Player, raw_request: any)
 	if session == nil or not session.active then
 		return
 	end
+	-- charge cheap limits before parsing so malformed traffic cannot amplify work.
 	if not self:_consume_server_bucket() then
 		self:_security_violation(session, "server_rate_limit", 0.5)
 		return
@@ -164,6 +165,7 @@ function router:_on_request(player: Player, raw_request: any)
 		return
 	end
 
+	-- exact retries get the original response; altered reuse is treated as probing.
 	local cached = self:_cached_result(session, request.request_id)
 	if cached ~= nil then
 		if cached.sequence ~= request.sequence or not utility.deep_equal(cached.request, request) then
@@ -190,6 +192,7 @@ function router:_on_request(player: Player, raw_request: any)
 		self.push_remote:FireClient(player, packet)
 		return
 	end
+	-- consume the sequence before dispatch so a failed action cannot be replayed.
 	session.last_sequence = request.sequence
 
 	local limit = config.action_limits[request.action]

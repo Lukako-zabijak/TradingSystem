@@ -2,6 +2,7 @@
 
 local protocol = {}
 
+-- this read is the authority after a datastore write returns an unknown result.
 local function read_current(transaction_id: string, ops: any)
 	local current, read_error = ops.get_consistent(transaction_id)
 	if current == nil then
@@ -43,6 +44,7 @@ local function drive_commit(transaction: any, ops: any)
 		return false, "commit_not_decided"
 	end
 
+	-- committing is irreversible; recovery may only replay these idempotent postimages.
 	for _, user_id in ipairs(transaction.users) do
 		local current, renew_error = renew_or_resolve(transaction, ops)
 		if current == nil then
@@ -74,6 +76,7 @@ local function drive_commit(transaction: any, ops: any)
 end
 
 local function drive_abort(transaction: any, ops: any)
+	-- a worker can discover a newer commit decision while it is trying to abort.
 	if transaction.state == "completed" or transaction.state == "committing" then
 		return drive_commit(transaction, ops)
 	end
@@ -162,6 +165,7 @@ function protocol.execute(transaction: any, ops: any)
 		end
 	end
 
+	-- persist the decision before either inventory receives the other side's items.
 	local committing, decision_error = ops.transition(transaction.id, "committing")
 	if committing == nil then
 		local current, read_error = read_current(transaction.id, ops)

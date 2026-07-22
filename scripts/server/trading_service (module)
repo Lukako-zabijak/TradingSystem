@@ -440,6 +440,7 @@ function service:_finish_local_commit(trade: any, transaction: any)
 end
 
 function service:_watch_commit(trade: any)
+	-- one local watcher owns a trade; durable recovery remains safe across servers.
 	if self.commit_workers[trade.id] ~= nil then
 		return
 	end
@@ -835,6 +836,7 @@ function service:_start_lease_loop()
 					math.max(0, available_budget - config.lease_budget_reserve)
 				)
 				or 0
+			-- refresh the closest expirations first when datastore budget is tight.
 			local due = {}
 			for _, session in pairs(self.sessions) do
 				if

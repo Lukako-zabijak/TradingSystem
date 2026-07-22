@@ -109,6 +109,7 @@ end
 function gateway:get_consistent(store: GlobalDataStore, key: string, attempts: number?)
 	self.metrics.gets += 1
 	return self:_run("get", attempts or config.read_attempts, function()
+		-- cached reads cannot settle an ambiguous transaction decision.
 		local options = Instance.new("DataStoreGetOptions")
 		options.UseCache = false
 		return store:GetAsync(key, options)

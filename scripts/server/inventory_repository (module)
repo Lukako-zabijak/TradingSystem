@@ -101,6 +101,7 @@ function repository:_begin_mutation(operation: any)
 	if type(operation) ~= "table" or not utility.is_mutation_id(operation.id) then
 		return nil, "invalid_mutation_operation"
 	end
+	-- the journal entry is the durable identity of a grant or revoke retry.
 	local candidate, candidate_error = schema.normalize_mutation_operation(operation, operation.id)
 	if candidate == nil then
 		return nil, candidate_error
@@ -528,6 +529,7 @@ function repository:mutate(
 end
 
 function repository:prepare(session: any, transaction: any)
+	-- preparation reserves the inventory but never moves an item.
 	return self:with_lock(session, function()
 		if not session.active or not session.ready or session.record == nil then
 			return false, "not_ready"
@@ -680,6 +682,7 @@ function repository:rollback_user(user_id: number, transaction_id: string, sessi
 end
 
 function repository:_apply_transaction(transaction: any, user_id: number, session: any?)
+	-- this callback recomputes the postimage from authoritative stored state.
 	local denied_reason = nil
 	local ok, saved_or_error = self.gateway:update(self.store, inventory_key(user_id), function(current)
 		local record, reason = schema.normalize_inventory(current, user_id)
@@ -765,6 +768,7 @@ function repository:apply_transaction(transaction: any, user_id: number, session
 end
 
 function repository:_finalize_user(user_id: number, transaction_id: string, session: any?)
+	-- keep the pending marker until the matching receipt proves the apply completed.
 	local denied_reason = nil
 	local ok, saved_or_error = self.gateway:update(self.store, inventory_key(user_id), function(current)
 		local record = schema.normalize_inventory(current, user_id)

@@ -129,6 +129,7 @@ function repository.new(gateway: any, observability: any)
 end
 
 function repository:_set_indexed(transaction_id: string, indexed: boolean, touch: boolean?)
+	-- unresolved entries are never evicted to make room for newer trades.
 	local denied_reason = nil
 	local ok, result = self.gateway:update(self.open_store, open_index_key(transaction_id), function(current)
 		local index = {}
@@ -501,6 +502,7 @@ function repository:_scan_transaction_keys(fence: any)
 end
 
 function repository:_run_open_index_migration(owner: string)
+	-- old servers used one bounded index, so migration drains it before and after the full scan.
 	local claimed, claim_error = self:_claim_index_migration(owner)
 	if claimed == nil then
 		return false, claim_error
@@ -704,6 +706,7 @@ function repository:renew(transaction_id: string, fence: any)
 end
 
 function repository:transition(transaction_id: string, fence: any, next_state: string)
+	-- the datastore callback checks the fence and state together at the write boundary.
 	local denied_reason = nil
 	local ok, saved_or_error = self.gateway:update(self.store, transaction_key(transaction_id), function(current)
 		local transaction, reason = schema.normalize_transaction(current, transaction_id)

@@ -101,6 +101,7 @@ function coordinator:build_transaction(trade: any)
 end
 
 function coordinator:_ops(fence: any)
+	-- protocol code receives only fenced operations, not repository internals.
 	return {
 		create = function(transaction)
 			return self.transaction_repository:create(transaction)
@@ -207,6 +208,7 @@ function coordinator:recover_once(transaction_id: string, preferred_fence: any?,
 		return false, read_error
 	end
 
+	-- an expired or foreign coordinator must be claimed before participant writes resume.
 	local fence = preferred_fence
 	if transaction.state ~= "completed" and transaction.state ~= "aborted" then
 		if not same_fence(transaction, fence) then

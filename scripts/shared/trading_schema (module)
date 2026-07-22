@@ -243,6 +243,7 @@ function schema.new_inventory_record(user_id: number): any
 end
 
 local function migrate_inventory(raw_record: any): (any?, string?)
+	-- migration is intentionally narrow: unknown versions fail closed.
 	if raw_record == nil then
 		return nil
 	end
@@ -560,6 +561,7 @@ local function validate_item_ids(value: any): (any?, string?)
 end
 
 function schema.validate_request(raw_request: any): (any?, string?)
+	-- remote payloads are rebuilt from accepted fields instead of returned by reference.
 	if not utility.has_only_keys(raw_request, envelope_keys, 6) then
 		return nil, "invalid_envelope"
 	end
@@ -645,6 +647,7 @@ function schema.validate_request(raw_request: any): (any?, string?)
 end
 
 function schema.normalize_transaction(raw_transaction: any, expected_id: string): (any?, string?)
+	-- every datastore read crosses the same validation boundary as a fresh record.
 	if type(raw_transaction) ~= "table" then
 		return nil, "invalid_transaction"
 	end
